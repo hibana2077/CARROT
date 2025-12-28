@@ -1,6 +1,8 @@
 # Deep Learning Framework
 torch==2.8.0
 torchvision
+torchmetrics
+einops
 timm
 
 # Data Processing
@@ -18,6 +20,18 @@ scikit-image
 # File formats
 pyarrow
 fastparquet
+
+# Graphical Models
+networkx
+
+# Model Saving and Loading
+joblib
+
+# Interpretability
+captum
+
+# Graph Neural Networks
+torch-geometric
 
 # Experiment tracking and visualization
 wandb
