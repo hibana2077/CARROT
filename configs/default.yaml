@@ -1,0 +1,15 @@
+# Default Configuration for CARROT
+
+# Dataset
+dataset: soybean
+batch_size: 32
+num_workers: 4
+
+# Model
+model: vit_base_patch16_224
+
+# CARROT Hyperparameters
+sigma_s: 0.5       # Spatial kernel width
+sigma_f: 1.0       # Feature kernel width
+diffusion_t: 1.0   # Diffusion time
+lambda_reg: 1.0    # Ridge regression regularization
