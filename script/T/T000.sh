@@ -16,4 +16,5 @@ export HF_HUB_OFFLINE=1
 
 cd ../..
 python3 src/main.py \
+	--config configs/default.yaml \
 	>> T000.log 2>&1
