@@ -39,6 +39,11 @@ def parse_args():
     parser.add_argument('--diffusion_t', type=float, default=1.0, help='Diffusion time t')
     parser.add_argument('--lambda_reg', type=float, default=1.0, help='Ridge regression regularization lambda')
     
+    # Attribution
+    parser.add_argument('--analyze_attribution', action='store_true', default=True, help='Run attribution analysis')
+    parser.add_argument('--attribution_limit', type=int, default=-1, help='Number of test samples to analyze (-1 for all)')
+    parser.add_argument('--top_k', type=int, default=5, help='Top K influential samples to retrieve')
+    
     args = parser.parse_args()
     
     # If config file is specified, load it and override defaults, but let command line args override config
@@ -155,6 +160,10 @@ def main():
     correct = 0
     total = 0
     
+    # Store test features and labels for attribution
+    G_test_list = []
+    Y_test_list = []
+    
     with torch.no_grad():
         for images, labels in tqdm(test_loader, desc="Evaluating"):
             images = images.to(device)
@@ -172,49 +181,99 @@ def main():
             
             correct += (predictions == labels).sum().item()
             total += labels.size(0)
+            
+            if args.analyze_attribution:
+                G_test_list.append(g.cpu())
+                Y_test_list.append(labels.cpu())
 
     accuracy = correct / total
     print(f"Test Accuracy: {accuracy:.4f}")
 
-    # 6. Attribution Demo
-    print("\n=== Attribution Demo ===")
-    print("Analyzing the first image from the test set...")
-    
-    test_image, test_label = test_dataset[0]
-    test_image = test_image.unsqueeze(0).to(device)
-    
-    with torch.no_grad():
-        out = backbone(test_image)
-        H, P = out.H, out.P
-        regions = RegionSet(H, P)
-        W, L = graph_builder.build(regions)
-        H_prime = operator.forward(H, L)
-        g_test = readout(H_prime) # (1, D)
+    # 6. Attribution Analysis
+    if args.analyze_attribution:
+        print("\n=== Attribution Analysis ===")
         
-        # Calculate influence of training samples
-        # Note: Y_train is passed but not used in the current influence calculation function
-        # which returns the raw influence weights.
-        influence = training_contribution(g_test, G_train, Y_train, lambda_reg=LAMBDA_REG)
+        G_test = torch.cat(G_test_list, dim=0).to(device)
+        Y_test = torch.cat(Y_test_list, dim=0).to(device)
         
-        # Find most influential training samples
-        top_k = 5
-        # Sort by absolute influence
-        top_indices = torch.topk(torch.abs(influence), top_k).indices[0]
+        num_test = G_test.size(0)
+        limit = args.attribution_limit if args.attribution_limit > 0 else num_test
+        limit = min(limit, num_test)
         
-        print(f"Test Image Label: {test_label} ({test_dataset.get_class_name(0) if hasattr(test_dataset, 'get_class_name') else ''})")
-        print(f"Top {top_k} influential training samples:")
+        print(f"Analyzing attribution for {limit} test samples...")
         
-        for idx in top_indices:
-            idx_val = idx.item()
-            inf_val = influence[0, idx_val].item()
-            train_label = Y_train[idx_val].item() if Y_train.dim() == 1 else torch.argmax(Y_train[idx_val]).item()
+        # Metrics
+        top_k_consistency = 0.0
+        
+        # Process in batches to avoid OOM if N_test * N_train is too large
+        # But for simplicity, we iterate one by one or small chunks if needed.
+        # Given UFGVC sizes, we can probably do a loop.
+        
+        results = []
+        
+        for i in tqdm(range(limit), desc="Attribution"):
+            g_i = G_test[i:i+1] # (1, D)
+            y_i = Y_test[i].item()
             
-            # Try to get class name if possible
-            class_name = ""
-            if hasattr(train_dataset, 'get_class_name'):
-                class_name = f"({train_dataset.get_class_name(idx_val)})"
+            # Calculate influence: (1, N_train)
+            influence = training_contribution(g_i, G_train, Y_train, lambda_reg=LAMBDA_REG)
+            
+            # Get Top-K
+            # Sort by absolute influence
+            top_indices = torch.topk(torch.abs(influence), args.top_k).indices[0] # (K,)
+            
+            # Check consistency
+            # Note: Y_train might be one-hot or indices. 
+            # In head.fit, we converted Y_train to one-hot if it was 1D.
+            # So Y_train here is likely one-hot (N_train, C).
+            
+            current_consistency = 0
+            retrieved_samples = []
+            
+            for idx in top_indices:
+                idx_val = idx.item()
+                inf_val = influence[0, idx_val].item()
                 
-            print(f"  Train Sample #{idx_val}: Influence = {inf_val:.6f}, Label = {train_label} {class_name}")
+                # Get label of training sample
+                if Y_train.dim() > 1:
+                    train_label = torch.argmax(Y_train[idx_val]).item()
+                else:
+                    train_label = Y_train[idx_val].item()
+                
+                if train_label == y_i:
+                    current_consistency += 1
+                
+                retrieved_samples.append({
+                    'train_idx': idx_val,
+                    'influence': inf_val,
+                    'label': train_label
+                })
+            
+            top_k_consistency += (current_consistency / args.top_k)
+            
+            results.append({
+                'test_idx': i,
+                'test_label': y_i,
+                'top_k_samples': retrieved_samples
+            })
+            
+        avg_consistency = top_k_consistency / limit
+        print(f"\nAttribution Results (Limit: {limit}):")
+        print(f"Average Top-{args.top_k} Label Consistency: {avg_consistency:.4f}")
+        print("(Fraction of retrieved training samples sharing the same label as the test sample)")
+        
+        # Save results
+        save_path = f"attribution_results_{DATASET_NAME}.pt"
+        torch.save(results, save_path)
+        print(f"Detailed results saved to {save_path}")
+        
+        # Show one example (Sample Visualization)
+        print("\n--- Sample Visualization (First Test Image) ---")
+        res = results[0]
+        print(f"Test Image Label: {res['test_label']}")
+        print(f"Top {args.top_k} influential training samples:")
+        for s in res['top_k_samples']:
+            print(f"  Train #{s['train_idx']}: Influence={s['influence']:.4f}, Label={s['label']}")
 
 if __name__ == "__main__":
     main()
