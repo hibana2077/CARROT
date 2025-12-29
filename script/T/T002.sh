@@ -18,7 +18,7 @@ cd ../..
 python3 src/main.py \
 	--model vit_base_patch16_224.dino \
 	--fine_tune_backbone \
-	--batch_size 1024 \
+	--batch_size 512 \
 	--ft_epochs 320 \
 	--seed 123 \
 	>> T002.log 2>&1
