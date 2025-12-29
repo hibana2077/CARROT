@@ -16,7 +16,7 @@ export HF_HUB_OFFLINE=1
 
 cd ../..
 python3 src/main.py \
-	--model vit_base_patch16_224.sam \
+	--model vit_base_patch16_224.dino \
 	--fine_tune_backbone \
 	--ft_epochs 100 \
 	>> T002.log 2>&1
