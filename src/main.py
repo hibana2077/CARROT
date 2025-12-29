@@ -56,6 +56,37 @@ def parse_args():
     parser.add_argument('--diffusion_t', type=float, default=1.0, help='Diffusion time t')
     parser.add_argument('--lambda_reg', type=float, default=1.0, help='Ridge regression regularization lambda')
 
+    # Graph building (B/C)
+    parser.add_argument('--graph_feature_norm', action='store_true', help='L2-normalize features before computing W_f')
+    parser.add_argument(
+        '--graph_feature_metric',
+        type=str,
+        default='l2',
+        help="Feature distance metric for W_f: l2|cosine",
+    )
+    parser.add_argument(
+        '--graph_adaptive_sigma',
+        action='store_true',
+        help='Use per-batch distance percentile to set sigma (reduces exp underflow)',
+    )
+    parser.add_argument(
+        '--graph_sigma_percentile',
+        type=float,
+        default=0.5,
+        help='Percentile for adaptive sigma (e.g., 0.5=median, 0.9=larger scale)',
+    )
+    parser.add_argument(
+        '--graph_knn_k',
+        type=int,
+        default=0,
+        help='kNN sparsify W: keep top-k neighbors per node (0 disables)',
+    )
+    parser.add_argument(
+        '--graph_force_fp32',
+        action='store_true',
+        help='Force fp32 for distance/exp to avoid fp16 underflow',
+    )
+
     # Readout
     parser.add_argument(
         '--readout',
@@ -217,7 +248,16 @@ def main():
     # If fine-tuning, we start unfrozen. Otherwise frozen.
     init_freeze = not args.fine_tune_backbone
     backbone = TimmViTPatchBackbone(MODEL_NAME, pretrained=True, freeze=init_freeze, device=device)
-    graph_builder = RegionGraphBuilder(sigma_s=SIGMA_S, sigma_f=SIGMA_F)
+    graph_builder = RegionGraphBuilder(
+        sigma_s=SIGMA_S,
+        sigma_f=SIGMA_F,
+        feature_norm=args.graph_feature_norm,
+        feature_metric=args.graph_feature_metric,
+        adaptive_sigma=args.graph_adaptive_sigma,
+        sigma_percentile=args.graph_sigma_percentile,
+        knn_k=args.graph_knn_k,
+        force_fp32=args.graph_force_fp32,
+    )
     operator = DiffusionOperator(t=DIFFUSION_T)
     readout = GraphReadout(method=args.readout, top_k=args.readout_top_k)
     head = RidgeHead(lambda_reg=LAMBDA_REG)
@@ -458,7 +498,16 @@ def main():
         ]
 
         # Compute baseline at (t=0, sigma=cfg)
-        base_graph = RegionGraphBuilder(sigma_s=args.sigma_s, sigma_f=args.sigma_f)
+        base_graph = RegionGraphBuilder(
+            sigma_s=args.sigma_s,
+            sigma_f=args.sigma_f,
+            feature_norm=args.graph_feature_norm,
+            feature_metric=args.graph_feature_metric,
+            adaptive_sigma=args.graph_adaptive_sigma,
+            sigma_percentile=args.graph_sigma_percentile,
+            knn_k=args.graph_knn_k,
+            force_fp32=args.graph_force_fp32,
+        )
         base_op = DiffusionOperator(t=0.0)
         H0, W0, L0, Hp0, g0 = _extract_one(images, backbone, base_graph, base_op, readout)
         logits0 = head.predict(g0)
@@ -474,7 +523,16 @@ def main():
         # Sweep (t, sigma)
         diag_store = {}
         for (sigma_s, sigma_f, sigma_tag) in sigma_pairs:
-            gb = RegionGraphBuilder(sigma_s=sigma_s, sigma_f=sigma_f)
+            gb = RegionGraphBuilder(
+                sigma_s=sigma_s,
+                sigma_f=sigma_f,
+                feature_norm=args.graph_feature_norm,
+                feature_metric=args.graph_feature_metric,
+                adaptive_sigma=args.graph_adaptive_sigma,
+                sigma_percentile=args.graph_sigma_percentile,
+                knn_k=args.graph_knn_k,
+                force_fp32=args.graph_force_fp32,
+            )
             # W stats independent of t; compute once per sigma using baseline H/P
             with torch.no_grad():
                 out_tmp = backbone(images)
