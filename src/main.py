@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
@@ -32,6 +34,9 @@ def parse_args():
     
     # Model
     parser.add_argument('--model', type=str, default='vit_base_patch16_224', help='timm model name')
+    parser.add_argument('--fine_tune_backbone', action='store_true', help='Fine-tune the backbone before CARROT extraction')
+    parser.add_argument('--ft_epochs', type=int, default=10, help='Number of epochs for backbone fine-tuning')
+    parser.add_argument('--ft_lr', type=float, default=1e-4, help='Learning rate for backbone fine-tuning')
     
     # CARROT Hyperparameters
     parser.add_argument('--sigma_s', type=float, default=0.5, help='Spatial kernel width')
@@ -110,11 +115,77 @@ def main():
 
     # 2. Initialize Modules
     print("Initializing CARROT modules...")
-    backbone = TimmViTPatchBackbone(MODEL_NAME, pretrained=True, freeze=True, device=device)
+    # If fine-tuning, we start unfrozen. Otherwise frozen.
+    init_freeze = not args.fine_tune_backbone
+    backbone = TimmViTPatchBackbone(MODEL_NAME, pretrained=True, freeze=init_freeze, device=device)
     graph_builder = RegionGraphBuilder(sigma_s=SIGMA_S, sigma_f=SIGMA_F)
     operator = DiffusionOperator(t=DIFFUSION_T)
     readout = GraphReadout(method='mean')
     head = RidgeHead(lambda_reg=LAMBDA_REG)
+
+    # 2.5 Fine-tune Backbone (Optional)
+    if args.fine_tune_backbone:
+        print(f"Fine-tuning backbone for {args.ft_epochs} epochs...")
+        
+        # Determine embedding dim
+        dummy_input = torch.randn(1, 3, 224, 224).to(device)
+        with torch.no_grad():
+            out = backbone(dummy_input)
+        embed_dim = out.H.shape[-1]
+        
+        # Determine num classes
+        try:
+            num_classes = len(train_dataset.classes)
+        except:
+            all_labels = [y for _, y in train_dataset]
+            num_classes = len(set(all_labels))
+            
+        print(f"Fine-tuning with {num_classes} classes.")
+        ft_head = nn.Linear(embed_dim, num_classes).to(device)
+        
+        # Optimizer for backbone + head
+        optimizer = optim.AdamW(list(backbone.model.parameters()) + list(ft_head.parameters()), lr=args.ft_lr)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Training Loop
+        backbone.model.train()
+        ft_head.train()
+        
+        # We need a shuffled loader for training
+        ft_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=args.num_workers)
+        
+        for epoch in range(args.ft_epochs):
+            total_loss = 0
+            correct = 0
+            total = 0
+            pbar = tqdm(ft_loader, desc=f"Fine-tuning Epoch {epoch+1}/{args.ft_epochs}")
+            for images, labels in pbar:
+                images, labels = images.to(device), labels.to(device)
+                
+                optimizer.zero_grad()
+                
+                # Forward
+                out = backbone(images) # (B, N, D)
+                # Mean pool for classification
+                features = out.H.mean(dim=1) # (B, D)
+                logits = ft_head(features)
+                
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                pred = logits.argmax(dim=1)
+                correct += (pred == labels).sum().item()
+                total += labels.size(0)
+                
+                pbar.set_postfix({'loss': total_loss/total, 'acc': correct/total})
+        
+        print("Fine-tuning complete. Freezing backbone.")
+        # Freeze backbone for CARROT
+        backbone.model.eval()
+        for p in backbone.model.parameters():
+            p.requires_grad = False
 
     # 3. Extract Training Features
     print("Extracting training features (G_train)...")

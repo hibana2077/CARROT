@@ -52,7 +52,6 @@ class TimmViTPatchBackbone(nn.Module):
         if device is not None:
             self.model.to(device)
 
-    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> PatchOutput:
         """
         x: (B, 3, H, W)
