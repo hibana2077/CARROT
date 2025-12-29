@@ -57,7 +57,16 @@ def parse_args():
     parser.add_argument('--lambda_reg', type=float, default=1.0, help='Ridge regression regularization lambda')
 
     # Readout
-    parser.add_argument('--readout', type=str, default='mean', help='Readout method: mean|sum|max|topk|degree')
+    parser.add_argument(
+        '--readout',
+        type=str,
+        default='mean',
+        help=(
+            'Readout method: '
+            'mean|sum|max|topk|degree|'
+            'mean_max|mean_var|residual|residual_abs'
+        ),
+    )
     parser.add_argument('--readout_top_k', type=int, default=8, help='Top-k for readout=topk')
 
     # Diagnostics
@@ -140,7 +149,7 @@ def _extract_one(
     W, L = graph_builder.build(regions)
     H_prime = operator.forward(H, L)
     try:
-        g = readout(H_prime, W=W)
+        g = readout(H_prime, W=W, H=H)
     except TypeError:
         # Backward compatibility in case readout signature differs
         g = readout(H_prime)
@@ -336,7 +345,10 @@ def main():
             H_prime = operator.forward(H, L)
             
             # Readout
-            g = readout(H_prime)
+            try:
+                g = readout(H_prime, W=W, H=H)
+            except TypeError:
+                g = readout(H_prime)
             
             G_train_list.append(g.cpu())
             Y_train_list.append(labels)
@@ -364,11 +376,11 @@ def main():
             W0, L0 = graph_builder.build(regions0)
             H0_prime = operator.forward(H0, L0)
             try:
-                g_from_Hprime = readout(H0_prime, W=W0)
+                g_from_Hprime = readout(H0_prime, W=W0, H=H0)
             except TypeError:
                 g_from_Hprime = readout(H0_prime)
             try:
-                g_from_H = readout(H0, W=W0)
+                g_from_H = readout(H0, W=W0, H=H0)
             except TypeError:
                 g_from_H = readout(H0)
             delta_g = _l2(g_from_Hprime - g_from_H)
@@ -402,7 +414,10 @@ def main():
             regions = RegionSet(H, P)
             W, L = graph_builder.build(regions)
             H_prime = operator.forward(H, L)
-            g = readout(H_prime)
+            try:
+                g = readout(H_prime, W=W, H=H)
+            except TypeError:
+                g = readout(H_prime)
             
             logits = head.predict(g)
             predictions = torch.argmax(logits, dim=1)
@@ -488,7 +503,14 @@ def main():
 
                 # Within-config: ||H'-H||, ||g'-g||
                 h_delta = _l2(Hp - H)
-                g_delta = _l2(g - (H.mean(dim=1)))  # compare to mean(H) as a quick reference
+                # compare first-D dims to mean(H) as a quick reference (supports concat readouts)
+                h_mean = H.mean(dim=1)
+                if g.shape[-1] == h_mean.shape[-1]:
+                    g_ref = h_mean
+                else:
+                    g_ref = h_mean[..., : min(h_mean.shape[-1], g.shape[-1])]
+                g_cmp = g[..., : g_ref.shape[-1]]
+                g_delta = _l2(g_cmp - g_ref)
 
                 # Compare to baseline (t=0, sigma=cfg): ||Hp-Hp0||, ||g-g0||, ||logits-logits0||
                 hp_diff0 = _l2(Hp - Hp0)
