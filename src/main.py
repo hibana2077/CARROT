@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from tqdm import tqdm
 import sys
 import os
 import argparse
 import yaml
+import copy
 
 # Add project root to path to allow imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -154,12 +154,19 @@ def main():
         # We need a shuffled loader for training
         ft_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=args.num_workers)
         
+        best_acc = 0.0
+        best_backbone_state = None
+
         for epoch in range(args.ft_epochs):
+            # Training
+            backbone.model.train()
+            ft_head.train()
+
             total_loss = 0
             correct = 0
             total = 0
-            pbar = tqdm(ft_loader, desc=f"Fine-tuning Epoch {epoch+1}/{args.ft_epochs}")
-            for images, labels in pbar:
+            
+            for images, labels in ft_loader:
                 images, labels = images.to(device), labels.to(device)
                 
                 optimizer.zero_grad()
@@ -178,10 +185,39 @@ def main():
                 pred = logits.argmax(dim=1)
                 correct += (pred == labels).sum().item()
                 total += labels.size(0)
-                
-                pbar.set_postfix({'loss': total_loss/total, 'acc': correct/total})
+            
+            train_loss = total_loss / len(ft_loader)
+            train_acc = correct / total
+
+            # Validation
+            backbone.model.eval()
+            ft_head.eval()
+            test_correct = 0
+            test_total = 0
+            
+            with torch.no_grad():
+                for images, labels in test_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    out = backbone(images)
+                    features = out.H.mean(dim=1)
+                    logits = ft_head(features)
+                    pred = logits.argmax(dim=1)
+                    test_correct += (pred == labels).sum().item()
+                    test_total += labels.size(0)
+            
+            test_acc = test_correct / test_total
+            
+            print(f"Epoch [{epoch+1}/{args.ft_epochs}] Loss: {train_loss:.4f} Train Acc: {train_acc:.4f} Test Acc: {test_acc:.4f}")
+
+            if test_acc > best_acc:
+                best_acc = test_acc
+                best_backbone_state = copy.deepcopy(backbone.model.state_dict())
         
-        print("Fine-tuning complete. Freezing backbone.")
+        print(f"Fine-tuning complete. Best Test Acc: {best_acc:.4f}. Loading best backbone.")
+        if best_backbone_state is not None:
+            backbone.model.load_state_dict(best_backbone_state)
+
+        print("Freezing backbone.")
         # Freeze backbone for CARROT
         backbone.model.eval()
         for p in backbone.model.parameters():
@@ -193,7 +229,7 @@ def main():
     Y_train_list = []
 
     with torch.no_grad():
-        for images, labels in tqdm(train_loader, desc="Extracting Train"):
+        for images, labels in train_loader:
             images = images.to(device)
             
             # Backbone
@@ -236,7 +272,7 @@ def main():
     Y_test_list = []
     
     with torch.no_grad():
-        for images, labels in tqdm(test_loader, desc="Evaluating"):
+        for images, labels in test_loader:
             images = images.to(device)
             labels = labels.to(device)
             
@@ -282,7 +318,7 @@ def main():
         
         results = []
         
-        for i in tqdm(range(limit), desc="Attribution"):
+        for i in range(limit):
             g_i = G_test[i:i+1] # (1, D)
             y_i = Y_test[i].item()
             
