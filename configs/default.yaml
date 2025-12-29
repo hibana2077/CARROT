@@ -1,7 +1,7 @@
 # Default Configuration for CARROT
 
 # Dataset
-dataset: cotton80
+dataset: cub_200_2011
 batch_size: 32
 num_workers: 4
 
