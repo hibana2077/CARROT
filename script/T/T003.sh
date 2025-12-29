@@ -17,4 +17,5 @@ export HF_HUB_OFFLINE=1
 cd ../..
 python3 src/main.py \
 	--model vit_base_patch16_224.dino \
+	--seed 123 \
 	>> T003.log 2>&1

@@ -8,6 +8,8 @@ import os
 import argparse
 import yaml
 import copy
+import random
+import numpy as np
 
 # Add project root to path to allow imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,6 +22,16 @@ from src.carrot.operator import DiffusionOperator
 from src.carrot.readout import GraphReadout
 from src.carrot.head import RidgeHead
 from src.carrot.attribution import training_contribution
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def parse_args():
     parser = argparse.ArgumentParser(description="CARROT Experiment Runner")
@@ -44,6 +56,9 @@ def parse_args():
     parser.add_argument('--diffusion_t', type=float, default=1.0, help='Diffusion time t')
     parser.add_argument('--lambda_reg', type=float, default=1.0, help='Ridge regression regularization lambda')
     
+    # Reproducibility
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+
     # Attribution
     parser.add_argument('--analyze_attribution', action='store_true', default=True, help='Run attribution analysis')
     parser.add_argument('--attribution_limit', type=int, default=-1, help='Number of test samples to analyze (-1 for all)')
@@ -72,6 +87,9 @@ def parse_args():
 def main():
     args = parse_args()
     print(f"Configuration: {vars(args)}")
+
+    # Set random seed for reproducibility
+    set_seed(args.seed)
 
     # Configuration
     DATASET_NAME = args.dataset
