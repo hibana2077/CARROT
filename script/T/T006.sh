@@ -23,4 +23,5 @@ python3 src/main.py \
 	--sigma_s 0.1 \
 	--sigma_f 0.8 \
 	--diffusion_t 0.3 \
+	--diagnose_single \
 	>> T006.log 2>&1

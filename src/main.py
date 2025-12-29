@@ -55,12 +55,21 @@ def parse_args():
     parser.add_argument('--sigma_f', type=float, default=1.0, help='Feature kernel width')
     parser.add_argument('--diffusion_t', type=float, default=1.0, help='Diffusion time t')
     parser.add_argument('--lambda_reg', type=float, default=1.0, help='Ridge regression regularization lambda')
+
+    # Readout
+    parser.add_argument('--readout', type=str, default='mean', help='Readout method: mean|sum|max|topk|degree')
+    parser.add_argument('--readout_top_k', type=int, default=8, help='Top-k for readout=topk')
+
+    # Diagnostics
+    parser.add_argument('--diagnose_single', action='store_true', help='Print single-image t/sigma sensitivity diagnostics')
+    parser.add_argument('--diagnose_index', type=int, default=0, help='Which test sample index to diagnose')
     
     # Reproducibility
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
 
     # Attribution
     parser.add_argument('--analyze_attribution', action='store_true', default=True, help='Run attribution analysis')
+    parser.add_argument('--no_analyze_attribution', dest='analyze_attribution', action='store_false', help='Disable attribution analysis')
     parser.add_argument('--attribution_limit', type=int, default=-1, help='Number of test samples to analyze (-1 for all)')
     parser.add_argument('--top_k', type=int, default=5, help='Top K influential samples to retrieve')
     
@@ -83,6 +92,69 @@ def parse_args():
         args = parser.parse_args()
         
     return args
+
+
+def _w_stats(W: torch.Tensor, eps: float = 1e-12):
+    """Compute W mean/std and entropy (both with and without diagonal)."""
+    # W: (B, N, N)
+    B, N, _ = W.shape
+    off_mask = ~torch.eye(N, device=W.device, dtype=torch.bool)  # (N, N)
+
+    def _stats(flat: torch.Tensor):
+        mean = flat.mean().item() if flat.numel() else float('nan')
+        std = flat.std(unbiased=False).item() if flat.numel() else float('nan')
+        # entropy over weight mass
+        mass = flat.clamp_min(0)
+        Z = mass.sum()
+        if Z <= 0:
+            ent = float('nan')
+        else:
+            p = (mass / (Z + eps)).clamp_min(eps)
+            ent = (-p * torch.log(p)).sum().item()
+        return mean, std, ent
+
+    flat_all = W.reshape(-1)
+    # Boolean-index off-diagonal entries per sample: (B, N*(N-1)) then flatten
+    flat_off = W[:, off_mask].reshape(-1)
+
+    all_mean, all_std, all_ent = _stats(flat_all)
+    off_mean, off_std, off_ent = _stats(flat_off)
+
+    return {
+        'all': {'mean': all_mean, 'std': all_std, 'entropy': all_ent},
+        'offdiag': {'mean': off_mean, 'std': off_std, 'entropy': off_ent},
+    }
+
+
+@torch.no_grad()
+def _extract_one(
+    images: torch.Tensor,
+    backbone: TimmViTPatchBackbone,
+    graph_builder: RegionGraphBuilder,
+    operator: DiffusionOperator,
+    readout: GraphReadout,
+):
+    out = backbone(images)
+    H, P = out.H, out.P
+    regions = RegionSet(H, P)
+    W, L = graph_builder.build(regions)
+    H_prime = operator.forward(H, L)
+    try:
+        g = readout(H_prime, W=W)
+    except TypeError:
+        # Backward compatibility in case readout signature differs
+        g = readout(H_prime)
+    return H, W, L, H_prime, g
+
+
+def _l2(x: torch.Tensor) -> float:
+    return torch.linalg.vector_norm(x.reshape(x.size(0), -1), ord=2, dim=1).mean().item()
+
+
+def _print_diag_block(title: str, lines: list[str]):
+    print(f"\n=== {title} ===")
+    for line in lines:
+        print(line)
 
 def main():
     args = parse_args()
@@ -138,7 +210,7 @@ def main():
     backbone = TimmViTPatchBackbone(MODEL_NAME, pretrained=True, freeze=init_freeze, device=device)
     graph_builder = RegionGraphBuilder(sigma_s=SIGMA_S, sigma_f=SIGMA_F)
     operator = DiffusionOperator(t=DIFFUSION_T)
-    readout = GraphReadout(method='mean')
+    readout = GraphReadout(method=args.readout, top_k=args.readout_top_k)
     head = RidgeHead(lambda_reg=LAMBDA_REG)
 
     # 2.5 Fine-tune Backbone (Optional)
@@ -280,6 +352,37 @@ def main():
     head.fit(G_train, Y_train)
     print("Head fitted.")
 
+    # 4.5 Sanity-check: head trained on g_t (i.e., readout(H_prime), not readout(H))
+    # This prints a quick diagnostic on the first train batch.
+    try:
+        first_images, _ = next(iter(train_loader))
+        first_images = first_images.to(device)
+        with torch.no_grad():
+            out0 = backbone(first_images)
+            H0, P0 = out0.H, out0.P
+            regions0 = RegionSet(H0, P0)
+            W0, L0 = graph_builder.build(regions0)
+            H0_prime = operator.forward(H0, L0)
+            try:
+                g_from_Hprime = readout(H0_prime, W=W0)
+            except TypeError:
+                g_from_Hprime = readout(H0_prime)
+            try:
+                g_from_H = readout(H0, W=W0)
+            except TypeError:
+                g_from_H = readout(H0)
+            delta_g = _l2(g_from_Hprime - g_from_H)
+        _print_diag_block(
+            "Sanity Check (g_t vs g_0)",
+            [
+                f"Readout method: {args.readout}",
+                f"Mean ||g(H') - g(H)|| over first train batch: {delta_g:.6f}",
+                "(If this is ~0 for mean readout, diffusion can be 'washed out' by pooling.)",
+            ],
+        )
+    except Exception as e:
+        print(f"[Sanity Check] Skipped due to error: {e}")
+
     # 5. Evaluate
     print("Evaluating on test set...")
     correct = 0
@@ -313,6 +416,116 @@ def main():
 
     accuracy = correct / total
     print(f"Test Accuracy: {accuracy:.4f}")
+
+    # 5.5 Single-image diagnostics (t/sigma sensitivity)
+    if args.diagnose_single:
+        _print_diag_block(
+            "Diagnostics Notice",
+            [
+                "This repo currently has no explicit cache in graph/diffusion/readout/backbone (no memoization found).",
+                "So there's nothing to 'disable' unless you added caching elsewhere.",
+            ],
+        )
+
+        # Grab a single test sample deterministically
+        try:
+            img, _ = test_dataset[args.diagnose_index]
+        except Exception:
+            img, _ = test_dataset[0]
+        images = img.unsqueeze(0).to(device)
+
+        # Baselines and sweeps
+        t_list = [0.0, 10.0, 50.0, 100.0]
+        sigma_pairs = [
+            (args.sigma_s, args.sigma_f, 'sigma=cfg'),
+            (1e-6, 1e-6, 'sigma=1e-6'),
+            (1e6, 1e6, 'sigma=1e6'),
+        ]
+
+        # Compute baseline at (t=0, sigma=cfg)
+        base_graph = RegionGraphBuilder(sigma_s=args.sigma_s, sigma_f=args.sigma_f)
+        base_op = DiffusionOperator(t=0.0)
+        H0, W0, L0, Hp0, g0 = _extract_one(images, backbone, base_graph, base_op, readout)
+        logits0 = head.predict(g0)
+
+        lines = []
+        lines.append(f"Fixed input: test_dataset[{args.diagnose_index}] (fallback to 0 if OOB)")
+        lines.append(f"Baseline: t=0, sigma_s={args.sigma_s}, sigma_f={args.sigma_f}")
+        lines.append(f"||H'(t=0)-H||: {_l2(Hp0 - H0):.6f} (should be ~0)")
+        lines.append(f"||g'(t=0)-g||: {_l2(g0 - g0):.6f}")
+
+        _print_diag_block("Single-Image Diagnostics (Norms/Logits/W stats)", lines)
+
+        # Sweep (t, sigma)
+        diag_store = {}
+        for (sigma_s, sigma_f, sigma_tag) in sigma_pairs:
+            gb = RegionGraphBuilder(sigma_s=sigma_s, sigma_f=sigma_f)
+            # W stats independent of t; compute once per sigma using baseline H/P
+            with torch.no_grad():
+                out_tmp = backbone(images)
+                regions_tmp = RegionSet(out_tmp.H, out_tmp.P)
+                W_tmp, L_tmp = gb.build(regions_tmp)
+            stats = _w_stats(W_tmp)
+            _print_diag_block(
+                f"W Stats ({sigma_tag})",
+                [
+                    f"all:    mean={stats['all']['mean']:.6g} std={stats['all']['std']:.6g} entropy={stats['all']['entropy']:.6g}",
+                    f"offdiag: mean={stats['offdiag']['mean']:.6g} std={stats['offdiag']['std']:.6g} entropy={stats['offdiag']['entropy']:.6g}",
+                ],
+            )
+
+            for t in t_list:
+                op = DiffusionOperator(t=float(t))
+                H, W, L, Hp, g = _extract_one(images, backbone, gb, op, readout)
+                logits = head.predict(g)
+
+                diag_store[(sigma_tag, float(t))] = {
+                    'H': H.detach(),
+                    'Hp': Hp.detach(),
+                    'g': g.detach(),
+                    'logits': logits.detach(),
+                }
+
+                # Within-config: ||H'-H||, ||g'-g||
+                h_delta = _l2(Hp - H)
+                g_delta = _l2(g - (H.mean(dim=1)))  # compare to mean(H) as a quick reference
+
+                # Compare to baseline (t=0, sigma=cfg): ||Hp-Hp0||, ||g-g0||, ||logits-logits0||
+                hp_diff0 = _l2(Hp - Hp0)
+                g_diff0 = _l2(g - g0)
+                logit_diff0 = _l2(logits - logits0)
+
+                _print_diag_block(
+                    f"Diag ({sigma_tag}, t={t})",
+                    [
+                        f"||H'(t)-H||: {h_delta:.6f}",
+                        f"||g - mean(H)|| (ref): {g_delta:.6f}",
+                        f"vs baseline(t=0,sigma=cfg): ||H'-H'0||={hp_diff0:.6f}, ||g-g0||={g_diff0:.6f}, ||logits-logits0||={logit_diff0:.6f}",
+                    ],
+                )
+
+        # Explicit pairwise comparisons the user asked for
+        pair_lines = []
+        # t=0 vs t=10 (same sigma=cfg)
+        k0 = ('sigma=cfg', 0.0)
+        k10 = ('sigma=cfg', 10.0)
+        if k0 in diag_store and k10 in diag_store:
+            pair_lines.append("[t=0 vs t=10 @ sigma=cfg]")
+            pair_lines.append(f"||H'(10)-H'(0)||: {_l2(diag_store[k10]['Hp'] - diag_store[k0]['Hp']):.6f}")
+            pair_lines.append(f"||g(10)-g(0)||: {_l2(diag_store[k10]['g'] - diag_store[k0]['g']):.6f}")
+            pair_lines.append(f"||logits(10)-logits(0)||: {_l2(diag_store[k10]['logits'] - diag_store[k0]['logits']):.6f}")
+
+        # sigma=1e-6 vs sigma=1e6 (same t=10)
+        ks = ('sigma=1e-6', 10.0)
+        kl = ('sigma=1e6', 10.0)
+        if ks in diag_store and kl in diag_store:
+            pair_lines.append("[sigma=1e-6 vs sigma=1e6 @ t=10]")
+            pair_lines.append(f"||H'(large)-H'(small)||: {_l2(diag_store[kl]['Hp'] - diag_store[ks]['Hp']):.6f}")
+            pair_lines.append(f"||g(large)-g(small)||: {_l2(diag_store[kl]['g'] - diag_store[ks]['g']):.6f}")
+            pair_lines.append(f"||logits(large)-logits(small)||: {_l2(diag_store[kl]['logits'] - diag_store[ks]['logits']):.6f}")
+
+        if pair_lines:
+            _print_diag_block("Requested Pairwise Diffs", pair_lines)
 
     # 6. Attribution Analysis
     if args.analyze_attribution:
