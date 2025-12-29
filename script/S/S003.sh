@@ -17,8 +17,8 @@ export HF_HUB_OFFLINE=1
 cd ../..
 python3 src/main.py \
 	--model vit_base_patch16_224.dino \
-	--fine_tune_backbone \
-	--batch_size 128 \
-	--ft_epochs 320 \
 	--seed 123 \
-	>> T002.log 2>&1
+	--dataset cub_200_2011 \
+	--lambda_reg 0.01 \
+	--sigma_s 0.20 \
+	>> S003.log 2>&1
