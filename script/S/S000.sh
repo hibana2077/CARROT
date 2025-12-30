@@ -19,6 +19,10 @@ python3 src/main.py \
 	--model vit_base_patch16_224.dino \
 	--seed 123 \
 	--dataset cub_200_2011 \
-	--lambda_reg 0.01 \
+	--lambda_reg 0.001 \
 	--sigma_s 0.05 \
+	--sigma_f 0.8 \
+	--diffusion_t 0.3 \
+	--diagnose_single \
+	--readout residual \
 	>> S000.log 2>&1
