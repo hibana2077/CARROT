@@ -4,7 +4,7 @@
 #PBS -l ngpus=1
 #PBS -l ncpus=12
 #PBS -l mem=32GB
-#PBS -l walltime=00:10:00
+#PBS -l walltime=00:30:00
 #PBS -l wd
 #PBS -l storage=scratch/rp06
 
@@ -19,7 +19,7 @@ python src/main.py \
   --dataset cub_200_2011 --data_root ./data --download \
   --val_split train_split --train_val_ratio 0.1 \
   --model vit_base_patch16_224 --pretrained \
-  --epochs 3 --warmup_epochs 0 --train_last_n 0 \
+  --epochs 30 --warmup_epochs 0 --train_last_n 0 \
   --lr 1e-3 --lambda_l2 1e-2 \
   --batch_size 32 --num_workers 0 \
   --alpha_mode learn --alpha_lr 1e-1 \
