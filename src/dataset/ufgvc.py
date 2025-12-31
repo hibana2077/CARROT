@@ -5,7 +5,7 @@ from PIL import Image
 import io
 from torch.utils.data import Dataset
 import torch
-from typing import Optional, Callable, Tuple, Any, Dict
+from typing import Optional, Callable, Tuple, Any, Dict, Union
 from pathlib import Path
 import hashlib
 
@@ -115,7 +115,8 @@ class UFGVCDataset(Dataset):
         split: str = "train",
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
-        download: bool = True
+        download: bool = True,
+        return_index: bool = False,
     ):
         if dataset_name not in self.DATASETS:
             available = list(self.DATASETS.keys())
@@ -127,6 +128,7 @@ class UFGVCDataset(Dataset):
         self.split = split
         self.transform = transform
         self.target_transform = target_transform
+        self.return_index = return_index
         
         # Dataset file info
         self.url = self.dataset_config['url']
@@ -219,7 +221,7 @@ class UFGVCDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
     
-    def __getitem__(self, idx: int) -> Tuple[Any, Any]:
+    def __getitem__(self, idx: int) -> Union[Tuple[Any, Any], Tuple[Any, Any, int]]:
         if idx >= len(self.data):
             raise IndexError(f"Index {idx} out of range for dataset of size {len(self.data)}")
         
@@ -244,7 +246,18 @@ class UFGVCDataset(Dataset):
         if self.target_transform:
             label = self.target_transform(label)
         
+        if self.return_index:
+            return image, label, idx
         return image, label
+
+    def get_all_labels(self) -> torch.Tensor:
+        """Return all labels in dataset order as a 1D LongTensor.
+
+        This does NOT decode images and is safe to call for alpha statistics.
+        """
+        class_names = self.data["class_name"].tolist()
+        labels = [self.class_to_idx[name] for name in class_names]
+        return torch.tensor(labels, dtype=torch.long)
     
     def get_class_name(self, idx: int) -> str:
         """Get class name for a given index"""

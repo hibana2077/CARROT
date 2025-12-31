@@ -17,7 +17,11 @@ def extract_features(
     backbone.eval()
     feats_list: List[torch.Tensor] = []
     labels_list: List[torch.Tensor] = []
-    for images, targets in loader:
+    for batch in loader:
+        if len(batch) == 2:
+            images, targets = batch
+        else:
+            images, targets, _indices = batch
         images = images.to(device, non_blocking=True)
         feats = backbone(images)
         feats_list.append(feats.detach().cpu())

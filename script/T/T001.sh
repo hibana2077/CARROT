@@ -22,7 +22,8 @@ python3 src/main.py \
   --epochs 3 --warmup_epochs 0 --train_last_n 0 \
   --lr 1e-3 --lambda_l2 1e-2 \
   --batch_size 32 --num_workers 0 \
-  --augment \
-  --output_dir ./runs --run_name exp0_baseline \
+  --do_attribution --attribution_limit 20 --top_k 5 \
+  --similarity cosine --attribution_class pred \
+  --output_dir ./runs --run_name exp1_attr_baseline \
   --seed 42
-  >> T000.log 2>&1
+  >> T001.log 2>&1

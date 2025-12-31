@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.exp.common import accuracy_top1, avg_meter_compute, avg_meter_update
+from src.exp.modeling import freeze_batchnorm_stats
 
 
 def train_one_epoch(
@@ -17,35 +18,37 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_l2: float,
-    freeze_backbone: bool,
-    alpha: Optional[torch.Tensor],
+    warmup: bool,
 ) -> Tuple[float, float]:
-    if freeze_backbone:
-        backbone.eval()
-    else:
-        backbone.train()
+    # Warm-up: backbone is fully trainable; otherwise it may be partially trainable.
+    # If no backbone params require grad, eval mode avoids dropout noise.
+    backbone_trainable = any(p.requires_grad for p in backbone.parameters())
+    backbone.train(backbone_trainable)
+    if not warmup:
+        # If the backbone is partially trainable, keep BN running stats fixed.
+        freeze_batchnorm_stats(backbone)
     head.train()
 
     meter: Dict[str, float] = {}
     total = 0
 
-    for images, targets in loader:
+    for batch in loader:
+        if len(batch) == 2:
+            images, targets = batch
+        else:
+            images, targets, _indices = batch
+
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.set_grad_enabled(not freeze_backbone):
+        with torch.set_grad_enabled(backbone_trainable):
             feats = backbone(images)
         logits = head(feats)
 
-        ce = F.cross_entropy(logits, targets, reduction="none")
-        if alpha is not None:
-            raise RuntimeError(
-                "alpha training requires dataset indices. Use alpha_mode=none for now, "
-                "or extend the dataset to return (image, label, index)."
-            )
-        loss_data = ce.mean()
+        # Clean CE (no alpha weighting). Per docs: warm-up uses clean CE.
+        # We also keep training clean CE in later stages unless you reintroduce reweighting.
+        loss_data = F.cross_entropy(logits, targets, reduction="mean")
 
         loss_l2 = 0.5 * lambda_l2 * (
             head.weight.pow(2).sum() + (head.bias.pow(2).sum() if head.bias is not None else 0.0)
@@ -76,7 +79,12 @@ def evaluate(
 
     meter: Dict[str, float] = {}
     total = 0
-    for images, targets in loader:
+    for batch in loader:
+        if len(batch) == 2:
+            images, targets = batch
+        else:
+            images, targets, _indices = batch
+
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 

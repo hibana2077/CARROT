@@ -31,9 +31,9 @@ from src.exp.common import EpochMetrics, resolve_device, set_seed, write_csv_row
 from src.exp.data import make_dataloaders
 from src.exp.modeling import (
     create_backbone_and_head,
-    freeze_batchnorm_stats,
     make_optimizer,
     set_requires_grad,
+    set_trainable_backbone_groups,
 )
 from src.exp.representer import compute_representer_values, extract_features, representer_topk
 from src.exp.train import evaluate, train_one_epoch
@@ -50,12 +50,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_root", type=str, default="./data")
     p.add_argument("--output_dir", type=str, default="./runs")
     p.add_argument("--run_name", type=str, default="debug")
-    p.add_argument("--save_every", type=int, default=1)
     p.add_argument("--download", action="store_true")
 
     # Dataset
     p.add_argument("--dataset", type=str, default="soybean")
-    p.add_argument("--val_split", type=str, default="test")
+    # Use val for model selection to avoid test leakage; data loader will fallback if unavailable.
+    p.add_argument(
+        "--val_split",
+        type=str,
+        default="val",
+        choices=["val", "test", "train_split", "train"],
+        help=(
+            "Validation split to use. 'val' is default; if missing, loader falls back to 'test'. "
+            "Use 'train_split' to carve validation from the training split."
+        ),
+    )
+    p.add_argument(
+        "--train_val_ratio",
+        type=float,
+        default=0.1,
+        help="Only used when --val_split=train_split. Fraction of train held out for validation.",
+    )
+    p.add_argument(
+        "--train_val_seed",
+        type=int,
+        default=None,
+        help="Only used when --val_split=train_split. Random seed for the train/val split (defaults to --seed).",
+    )
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--augment", action="store_true")
     p.add_argument("--batch_size", type=int, default=32)
@@ -71,9 +92,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup_epochs", type=int, default=0, help="Stage-0 warmup: train backbone+head")
     p.add_argument("--lr", type=float, default=1e-3, help="Head LR (and backbone LR in warmup)")
     p.add_argument("--backbone_lr", type=float, default=1e-5, help="Backbone LR in warmup stage")
+    p.add_argument(
+        "--backbone_lr_mult",
+        type=float,
+        default=0.0,
+        help="If > 0, overrides --backbone_lr with (lr * backbone_lr_mult).",
+    )
     p.add_argument("--weight_decay", type=float, default=0.0, help="Optimizer weight decay (separate from explicit head L2)")
     p.add_argument("--lambda_l2", type=float, default=1e-2, help="Explicit L2 regularization strength for head")
     p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd"])
+
+    # Focus training (post warm-up): unfreeze last N backbone groups
+    p.add_argument(
+        "--train_last_n",
+        type=int,
+        default=0,
+        help=(
+            "After warm-up, freeze backbone and optionally unfreeze the last N discovered backbone groups "
+            "(e.g., last blocks/layers/stages). 0 means head-only after warm-up."
+        ),
+    )
 
     # Attribution
     p.add_argument("--do_attribution", action="store_true")
@@ -107,6 +145,9 @@ def main() -> None:
         augment=args.augment,
         val_split=args.val_split,
         download=args.download,
+        return_index=False,
+        train_val_ratio=float(args.train_val_ratio),
+        train_val_seed=(args.seed if args.train_val_seed is None else int(args.train_val_seed)),
     )
 
     backbone, head, feat_dim = create_backbone_and_head(
@@ -119,24 +160,50 @@ def main() -> None:
 
     metrics_csv = out_dir / "metrics.csv"
 
+    ckpt_last_path = out_dir / "ckpt_last.pt"
+    ckpt_best_path = out_dir / "ckpt_best.pt"
+    ckpt_best_warmup_path = out_dir / "ckpt_best_warmup.pt"
+
+    best_val_acc1 = float("-inf")
+    best_warmup_val_acc1 = float("-inf")
+
+    effective_backbone_lr = float(args.backbone_lr)
+    if float(args.backbone_lr_mult) > 0:
+        effective_backbone_lr = float(args.lr) * float(args.backbone_lr_mult)
+
+    optimizer = None
+    prev_trainable_key = None
+
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
-        in_warmup = epoch <= args.warmup_epochs
-        freeze_backbone = not in_warmup
-        set_requires_grad(backbone, not freeze_backbone)
-        if freeze_backbone:
-            freeze_batchnorm_stats(backbone)
+        # If we did warm-up, start focus stage from the best warm-up checkpoint.
+        if args.warmup_epochs > 0 and epoch == args.warmup_epochs + 1 and ckpt_best_warmup_path.exists():
+            ckpt = torch.load(ckpt_best_warmup_path, map_location=device)
+            backbone.load_state_dict(ckpt["backbone"])
+            head.load_state_dict(ckpt["head"])
 
-        optimizer = make_optimizer(
-            optimizer_name=args.optimizer,
-            head=head,
-            backbone=backbone,
-            freeze_backbone=freeze_backbone,
-            lr=args.lr,
-            backbone_lr=args.backbone_lr,
-            weight_decay=args.weight_decay,
-        )
+        in_warmup = epoch <= args.warmup_epochs
+        if in_warmup:
+            # Stage 0: train full backbone + head with clean CE
+            set_requires_grad(backbone, True)
+            trainable_key = ("warmup", "all")
+        else:
+            # Stage 1: freeze most of backbone, optionally unfreeze last N groups
+            trainable_groups = set_trainable_backbone_groups(backbone, train_last_n=int(args.train_last_n))
+            trainable_key = ("focus", tuple(trainable_groups))
+
+        # Rebuild optimizer only when trainable parameter set changes
+        if optimizer is None or trainable_key != prev_trainable_key:
+            optimizer = make_optimizer(
+                optimizer_name=args.optimizer,
+                head=head,
+                backbone=backbone,
+                lr=args.lr,
+                backbone_lr=effective_backbone_lr,
+                weight_decay=args.weight_decay,
+            )
+            prev_trainable_key = trainable_key
 
         train_loss, train_acc1 = train_one_epoch(
             backbone=backbone,
@@ -145,8 +212,7 @@ def main() -> None:
             optimizer=optimizer,
             device=device,
             lambda_l2=args.lambda_l2,
-            freeze_backbone=freeze_backbone,
-            alpha=None,
+            warmup=in_warmup,
         )
         val_loss, val_acc1 = evaluate(backbone=backbone, head=head, loader=val_loader, device=device)
 
@@ -169,14 +235,25 @@ def main() -> None:
         print(json.dumps(line, indent=2, sort_keys=True))
         write_csv_row(metrics_csv, line)
 
-        if args.save_every > 0 and (epoch % args.save_every == 0 or epoch == args.epochs):
-            ckpt = {
-                "epoch": epoch,
-                "args": vars(args),
-                "backbone": backbone.state_dict(),
-                "head": head.state_dict(),
-            }
-            torch.save(ckpt, out_dir / f"ckpt_epoch_{epoch}.pt")
+        ckpt = {
+            "epoch": epoch,
+            "args": vars(args),
+            "backbone": backbone.state_dict(),
+            "head": head.state_dict(),
+            "metrics": line,
+        }
+
+        # Always keep last checkpoint.
+        torch.save(ckpt, ckpt_last_path)
+
+        # Keep best checkpoints by validation accuracy.
+        if float(val_acc1) > best_val_acc1:
+            best_val_acc1 = float(val_acc1)
+            torch.save(ckpt, ckpt_best_path)
+
+        if in_warmup and float(val_acc1) > best_warmup_val_acc1:
+            best_warmup_val_acc1 = float(val_acc1)
+            torch.save(ckpt, ckpt_best_warmup_path)
 
     if args.do_attribution:
         print("Running representer attribution...")
