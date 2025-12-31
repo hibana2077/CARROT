@@ -29,14 +29,22 @@ if str(PROJECT_ROOT) not in os.sys.path:
 
 from src.exp.common import EpochMetrics, resolve_device, set_seed, write_csv_row
 from src.exp.data import make_dataloaders
+from src.exp.common import compute_alpha_stats
 from src.exp.modeling import (
     create_backbone_and_head,
     make_optimizer,
     set_requires_grad,
     set_trainable_backbone_groups,
 )
+from src.exp.alpha import AlphaConfig, AlphaWeights
 from src.exp.representer import compute_representer_values, extract_features, representer_topk
 from src.exp.train import evaluate, train_one_epoch
+
+from src.dataset.ufgvc import UFGVCDataset
+
+
+def _alpha_enabled(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "alpha_mode", "none")).strip().lower() != "none"
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,6 +110,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_l2", type=float, default=1e-2, help="Explicit L2 regularization strength for head")
     p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd"])
 
+    # CARROT alpha reweighting (head-only + 1-step unroll)
+    p.add_argument(
+        "--alpha_mode",
+        type=str,
+        default="none",
+        choices=["none", "learn"],
+        help=(
+            "Enable CARROT sample reweighting. 'learn' uses differentiable alpha (softplus(s)) and updates alpha "
+            "via 1-step unrolled bilevel (val-driven). Requires frozen backbone in focus stage (train_last_n=0)."
+        ),
+    )
+    p.add_argument("--alpha_lr", type=float, default=1e-1, help="Learning rate for alpha parameters (s).")
+    p.add_argument(
+        "--alpha_inner_lr",
+        type=float,
+        default=None,
+        help="Inner (unroll) LR for the simulated head step; defaults to --lr.",
+    )
+    p.add_argument(
+        "--alpha_entropy_reg",
+        type=float,
+        default=0.0,
+        help="Entropy regularizer strength for alpha (helps prevent collapse).",
+    )
+    p.add_argument(
+        "--alpha_s_l2_reg",
+        type=float,
+        default=0.0,
+        help="L2 regularizer on alpha parameters s (only in learn mode).",
+    )
+    p.add_argument(
+        "--alpha_classwise_batch_norm",
+        action="store_true",
+        help="If set, normalize alpha within each batch per class to keep per-class average alpha=1.",
+    )
+
     # Focus training (post warm-up): unfreeze last N backbone groups
     p.add_argument(
         "--train_last_n",
@@ -136,6 +180,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True), encoding="utf-8")
 
+    # Alpha reweighting requires sample indices.
+    return_index = _alpha_enabled(args)
+
     train_loader, val_loader, num_classes = make_dataloaders(
         dataset_name=args.dataset,
         data_root=args.data_root,
@@ -145,7 +192,7 @@ def main() -> None:
         augment=args.augment,
         val_split=args.val_split,
         download=args.download,
-        return_index=False,
+        return_index=return_index,
         train_val_ratio=float(args.train_val_ratio),
         train_val_seed=(args.seed if args.train_val_seed is None else int(args.train_val_seed)),
     )
@@ -173,6 +220,33 @@ def main() -> None:
 
     optimizer = None
     prev_trainable_key = None
+
+    alpha_weights = None
+    alpha_optimizer = None
+    train_labels_full = None
+    if _alpha_enabled(args):
+        if str(args.alpha_mode).strip().lower() != "learn":
+            raise ValueError("Only --alpha_mode=learn is supported in this implementation")
+
+        # Build a full train-split dataset to size alpha and compute classwise normalization/stats.
+        # NOTE: indices returned by loaders must correspond to this train split (works with Subset). 
+        train_ds_full = UFGVCDataset(
+            dataset_name=args.dataset,
+            root=args.data_root,
+            split="train",
+            transform=None,
+            download=args.download,
+            return_index=False,
+        )
+        train_labels_full = train_ds_full.get_all_labels()
+        alpha_cfg = AlphaConfig(
+            mode="learn",
+            entropy_reg=float(args.alpha_entropy_reg),
+            s_l2_reg=float(args.alpha_s_l2_reg),
+            classwise_batch_norm=bool(args.alpha_classwise_batch_norm),
+        )
+        alpha_weights = AlphaWeights(n_train=int(len(train_ds_full)), device=device, config=alpha_cfg)
+        alpha_optimizer = torch.optim.AdamW(alpha_weights.parameters(), lr=float(args.alpha_lr))
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -209,6 +283,11 @@ def main() -> None:
             backbone=backbone,
             head=head,
             loader=train_loader,
+            val_loader=(val_loader if _alpha_enabled(args) else None),
+            alpha_weights=alpha_weights,
+            alpha_optimizer=alpha_optimizer,
+            alpha_inner_lr=(args.lr if args.alpha_inner_lr is None else float(args.alpha_inner_lr)),
+            num_classes=int(num_classes),
             optimizer=optimizer,
             device=device,
             lambda_l2=args.lambda_l2,
@@ -219,6 +298,11 @@ def main() -> None:
         seconds = time.time() - t0
         lr_now = float(optimizer.param_groups[0]["lr"])
 
+        alpha_stats = {}
+        if alpha_weights is not None and train_labels_full is not None:
+            full_alpha = alpha_weights.full_alpha_detached(train_labels=train_labels_full, num_classes=int(num_classes))
+            alpha_stats = compute_alpha_stats(full_alpha)
+
         m = EpochMetrics(
             epoch=epoch,
             train_loss=train_loss,
@@ -227,6 +311,7 @@ def main() -> None:
             val_acc1=val_acc1,
             lr=lr_now,
             seconds=seconds,
+            **alpha_stats,
         )
 
         # Required: report per-epoch averaged metrics (NOT single-batch)
@@ -242,6 +327,11 @@ def main() -> None:
             "head": head.state_dict(),
             "metrics": line,
         }
+
+        if alpha_weights is not None:
+            ckpt["alpha"] = alpha_weights.state_dict()
+        if alpha_optimizer is not None:
+            ckpt["alpha_optimizer"] = alpha_optimizer.state_dict()
 
         # Always keep last checkpoint.
         torch.save(ckpt, ckpt_last_path)
