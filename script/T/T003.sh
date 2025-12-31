@@ -16,13 +16,14 @@ export HF_HUB_OFFLINE=1
 
 cd ../..
 python3 src/main.py \
-  --dataset soybean --data_root ./data \
+  --dataset cub_200_2011 --data_root ./data \
   --val_split train_split --train_val_ratio 0.1 \
   --model vit_base_patch16_224 --pretrained \
   --epochs 3 --warmup_epochs 0 --train_last_n 0 \
   --lr 1e-3 --lambda_l2 1e-2 \
   --batch_size 32 --num_workers 0 \
-  --augment \
-  --output_dir ./T000 --run_name T000 \
+  --do_attribution --attribution_limit 20 --top_k 5 \
+  --similarity cosine --attribution_class pred \
+  --output_dir ./T003 --run_name T003 \
   --seed 42
-  >> T000.log 2>&1
+  >> T003.log 2>&1

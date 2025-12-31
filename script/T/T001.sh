@@ -16,7 +16,7 @@ export HF_HUB_OFFLINE=1
 
 cd ../..
 python3 src/main.py \
-  --dataset soybean --data_root ./data --download \
+  --dataset soybean --data_root ./data \
   --val_split train_split --train_val_ratio 0.1 \
   --model vit_base_patch16_224 --pretrained \
   --epochs 3 --warmup_epochs 0 --train_last_n 0 \
