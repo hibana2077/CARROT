@@ -279,15 +279,16 @@ def main() -> None:
             )
             prev_trainable_key = trainable_key
 
+        alpha_active = _alpha_enabled(args) and (not in_warmup)
         train_loss, train_acc1 = train_one_epoch(
             backbone=backbone,
             head=head,
             loader=train_loader,
-            val_loader=(val_loader if _alpha_enabled(args) else None),
-            alpha_weights=alpha_weights,
-            alpha_optimizer=alpha_optimizer,
+            val_loader=(val_loader if alpha_active else None),
+            alpha_weights=(alpha_weights if alpha_active else None),
+            alpha_optimizer=(alpha_optimizer if alpha_active else None),
             alpha_inner_lr=(args.lr if args.alpha_inner_lr is None else float(args.alpha_inner_lr)),
-            num_classes=int(num_classes),
+            num_classes=(int(num_classes) if alpha_active else None),
             optimizer=optimizer,
             device=device,
             lambda_l2=args.lambda_l2,
