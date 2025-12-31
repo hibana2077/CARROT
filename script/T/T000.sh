@@ -23,6 +23,6 @@ python3 src/main.py \
   --lr 1e-3 --lambda_l2 1e-2 \
   --batch_size 32 --num_workers 0 \
   --augment \
-  --output_dir ./runs --run_name exp0_baseline \
+  --output_dir ./T000 --run_name T000 \
   --seed 42
   >> T000.log 2>&1

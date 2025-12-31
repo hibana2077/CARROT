@@ -24,6 +24,6 @@ python3 src/main.py \
   --batch_size 32 --num_workers 0 \
   --do_attribution --attribution_limit 20 --top_k 5 \
   --similarity cosine --attribution_class pred \
-  --output_dir ./runs --run_name exp1_attr_baseline \
+  --output_dir ./T001 --run_name T001 \
   --seed 42
   >> T001.log 2>&1
