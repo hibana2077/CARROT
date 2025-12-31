@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import List
 
 import torch
+from torch.utils.data import DataLoader
 
 # Allow imports when running as a script.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +29,7 @@ if str(PROJECT_ROOT) not in os.sys.path:
     os.sys.path.append(str(PROJECT_ROOT))
 
 from src.exp.common import EpochMetrics, resolve_device, set_seed, write_csv_row
-from src.exp.data import make_dataloaders
+from src.exp.data import build_transforms, make_dataloaders
 from src.exp.common import compute_alpha_stats
 from src.exp.modeling import (
     create_backbone_and_head,
@@ -319,6 +320,7 @@ def main() -> None:
         line = asdict(m)
         print("EpochSummary:")
         print(json.dumps(line, indent=2, sort_keys=True))
+        print(f"Acc: train_acc={float(train_acc1):.4f} val_acc={float(val_acc1):.4f}")
         write_csv_row(metrics_csv, line)
 
         ckpt = {
@@ -345,6 +347,31 @@ def main() -> None:
         if in_warmup and float(val_acc1) > best_warmup_val_acc1:
             best_warmup_val_acc1 = float(val_acc1)
             torch.save(ckpt, ckpt_best_warmup_path)
+
+    # Optional: report test accuracy if the dataset provides a 'test' split.
+    try:
+        _, eval_tf = build_transforms(img_size=int(args.img_size), augment=bool(args.augment))
+        test_ds = UFGVCDataset(
+            dataset_name=args.dataset,
+            root=args.data_root,
+            split="test",
+            transform=eval_tf,
+            download=args.download,
+            return_index=False,
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=int(args.batch_size),
+            shuffle=False,
+            num_workers=int(args.num_workers),
+            pin_memory=True,
+            drop_last=False,
+        )
+        test_loss, test_acc1 = evaluate(backbone=backbone, head=head, loader=test_loader, device=device)
+        print("TestSummary:")
+        print(json.dumps({"test_loss": float(test_loss), "test_acc": float(test_acc1)}, indent=2, sort_keys=True))
+    except Exception as e:
+        print(f"TestSummary: skipped (no usable test split): {e}")
 
     if args.do_attribution:
         print("Running representer attribution...")
