@@ -25,5 +25,4 @@ python src/main.py \
   --alpha_mode learn --alpha_lr 1e-1 \
   --alpha_entropy_reg 0.0 --alpha_s_l2_reg 0.0 --alpha_classwise_batch_norm \
   --output_dir ./T005 --run_name T005 \
-  --seed 42
-  >> T005.log 2>&1
+  --seed 42 >> T005.log 2>&1
