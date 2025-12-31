@@ -18,12 +18,13 @@ cd ../..
 python3 src/main.py \
   --dataset cub_200_2011 --data_root ./data \
   --val_split train_split --train_val_ratio 0.1 \
-  --model vit_base_patch16_224 --pretrained \
+  --model vit_base_patch32_clip_448.laion2b_ft_in12k_in1k --pretrained \
   --epochs 30 --warmup_epochs 15 --train_last_n 0 \
   --lr 1e-3 --lambda_l2 1e-2 \
   --batch_size 32 --num_workers 0 \
   --alpha_mode learn --alpha_lr 1e-1 \
   --alpha_entropy_reg 0.0 --alpha_s_l2_reg 0.0 --alpha_classwise_batch_norm \
   --output_dir ./T006 --run_name T006 \
+  --img_size 448 \
   --do_attribution \
   --seed 42 >> T006.log 2>&1
