@@ -15,7 +15,7 @@ export HF_HOME="/scratch/rp06/sl5952/RL-test/.cache"
 export HF_HUB_OFFLINE=1
 
 cd ../..
-python3 src/main.py \
+python3 -u src/main.py \
   --dataset cub_200_2011 --data_root ./data \
   --val_split train_split --train_val_ratio 0.1 \
   --model vit_base_patch32_clip_448.laion2b_ft_in12k_in1k --pretrained \

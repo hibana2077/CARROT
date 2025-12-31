@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -170,6 +171,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # When stdout is redirected (e.g., ">> file 2>&1"), Python may buffer output.
+    # Make logs visible immediately.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     print("Args:")
     print(json.dumps(vars(args), indent=2, sort_keys=True))
 
@@ -320,7 +330,7 @@ def main() -> None:
         line = asdict(m)
         print("EpochSummary:")
         print(json.dumps(line, indent=2, sort_keys=True))
-        print(f"Acc: train_acc={float(train_acc1):.4f} val_acc={float(val_acc1):.4f}")
+        print(f"Acc: train_acc={float(train_acc1):.4f} val_acc={float(val_acc1):.4f}", flush=True)
         write_csv_row(metrics_csv, line)
 
         ckpt = {
@@ -369,9 +379,12 @@ def main() -> None:
         )
         test_loss, test_acc1 = evaluate(backbone=backbone, head=head, loader=test_loader, device=device)
         print("TestSummary:")
-        print(json.dumps({"test_loss": float(test_loss), "test_acc": float(test_acc1)}, indent=2, sort_keys=True))
+        print(
+            json.dumps({"test_loss": float(test_loss), "test_acc": float(test_acc1)}, indent=2, sort_keys=True),
+            flush=True,
+        )
     except Exception as e:
-        print(f"TestSummary: skipped (no usable test split): {e}")
+        print(f"TestSummary: skipped (no usable test split): {e}", flush=True)
 
     if args.do_attribution:
         print("Running representer attribution...")
