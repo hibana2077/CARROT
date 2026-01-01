@@ -188,7 +188,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pretrained", action="store_true")
 
     p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--optimizer", type=str, default="sgd", choices=["sgd", "adamw"])
+    p.add_argument("--lr", type=float, default=0.03)
+    p.add_argument("--momentum", type=float, default=0.9)
+    p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--img_size", type=int, default=224)
@@ -254,12 +257,27 @@ def main() -> None:
     )
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    if args.optimizer == "sgd":
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         train_stats = train_one_epoch(model, train_loader, optimizer, device, criterion)
         eval_stats = evaluate(model, eval_loader, device, criterion)
+        scheduler.step()
         elapsed = time.time() - t0
 
         # Required format (no tqdm; accuracy is epoch-average)
@@ -268,6 +286,9 @@ def main() -> None:
             f"test_acc {eval_stats.acc:.4f} - {elapsed:.1f} seconds",
             flush=True,
         )
+
+        lr = optimizer.param_groups[0]["lr"]
+        print(f"lr {lr:.6f}", flush=True)
 
 
 if __name__ == "__main__":
