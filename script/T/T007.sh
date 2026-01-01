@@ -20,6 +20,6 @@ python3 -u src/main.py \
   --model vit_base_patch16_dinov3 --pretrained \
   --epochs 280 \
   --lr 1e-3 \
-  --batch_size 256 --num_workers 0 \
-  --img_size 512 \
+  --batch_size 1024 --num_workers 0 \
+  --img_size 256 \
   --seed 42 >> T007.log 2>&1
