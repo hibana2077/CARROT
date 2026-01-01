@@ -22,4 +22,4 @@ python3 -u src/main.py \
   --lr 1e-3 \
   --batch_size 32 --num_workers 0 \
   --img_size 512 \
-  --seed 42 >> T004.log 2>&1
+  --seed 42 >> T005.log 2>&1
