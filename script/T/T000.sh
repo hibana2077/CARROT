@@ -21,6 +21,5 @@ python3 -u src/main.py \
   --epochs 280 \
   --lr 1e-3 \
   --batch_size 32 --num_workers 0 \
-  --output_dir ./T000 --run_name T000 \
   --img_size 512 \
   --seed 42 >> T000.log 2>&1
