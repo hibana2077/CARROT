@@ -20,6 +20,6 @@ python3 -u src/main.py \
   --model vit_base_patch8_224.augreg2_in21k_ft_in1k --pretrained \
   --epochs 280 \
   --lr 1e-3 \
-  --batch_size 224 --num_workers 0 \
-  --img_size 512 \
+  --batch_size 512 --num_workers 0 \
+  --img_size 224 \
   --seed 42 >> T013.log 2>&1
