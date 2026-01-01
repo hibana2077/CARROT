@@ -2,7 +2,6 @@
 torch==2.8.0
 torchvision
 torchmetrics
-functorch
 einops
 timm
 
