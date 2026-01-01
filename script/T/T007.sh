@@ -19,7 +19,6 @@ python3 -u src/main.py \
   --dataset cotton80 --data_root ./data \
   --model vit_base_patch16_dinov3 --pretrained \
   --epochs 280 \
-  --lr 1e-3 \
-  --batch_size 1024 --num_workers 0 \
+  --batch_size 16 --num_workers 0 \
   --img_size 256 \
   --seed 42 >> T007.log 2>&1

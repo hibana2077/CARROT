@@ -19,7 +19,6 @@ python3 -u src/main.py \
   --dataset soybean --data_root ./data \
   --model efficientnet_x_b5.sw_r448_e450_in1k --pretrained \
   --epochs 280 \
-  --lr 1e-3 \
-  --batch_size 64 --num_workers 0 \
+  --batch_size 16 --num_workers 0 \
   --img_size 448 \
   --seed 42 >> T010.log 2>&1

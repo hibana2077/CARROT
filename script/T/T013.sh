@@ -19,7 +19,6 @@ python3 -u src/main.py \
   --dataset cub_200_2011 --data_root ./data \
   --model vit_base_patch8_224.augreg2_in21k_ft_in1k --pretrained \
   --epochs 280 \
-  --lr 1e-3 \
-  --batch_size 256 --num_workers 0 \
+  --batch_size 16 --num_workers 0 \
   --img_size 224 \
   --seed 42 >> T013.log 2>&1
