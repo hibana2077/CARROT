@@ -196,9 +196,9 @@ class UFGVCDataset(Dataset):
                 available_splits = df['split'].unique().tolist()
                 raise ValueError(f"No data found for split '{self.split}'. Available splits: {available_splits}")
             
-            # Get unique classes and create label mapping
-            # Handle numerical class names properly
-            unique_classes = self.data['class_name'].unique()
+            # IMPORTANT: build a single, stable label mapping from the FULL dataset
+            # so train/val/test splits share the same class_to_idx.
+            unique_classes = df['class_name'].unique()
             try:
                 # Try to sort numerically if all class names are numeric
                 self.classes = sorted(unique_classes, key=int)
