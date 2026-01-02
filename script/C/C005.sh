@@ -14,7 +14,7 @@ source /scratch/yp87/sl5952/CARROT/.venv/bin/activate
 export HF_HOME="/scratch/yp87/sl5952/CARROT/.cache"
 export HF_HUB_OFFLINE=1
 
-cd ../../..
+cd ../..
 python3 -u src/main.py \
   --dataset cotton80 --data_root ./data \
   --model vit_base_patch16_dinov3 --pretrained \
