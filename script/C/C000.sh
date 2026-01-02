@@ -20,7 +20,7 @@ python3 -u src/main.py \
   --model vit_base_patch16_dinov3 --pretrained \
   --epochs 280 \
   --batch_size 256 --num_workers 0 \
-  --img_size 288 \
+  --img_size 256 \
   --use_carrot \
   --carrot_lambda 0.02 --carrot_alpha 10 --carrot_topm 20 --carrot_conf_topk 20 --carrot_warmup_epochs 10 \
   --seed 42 >> C000.log 2>&1
