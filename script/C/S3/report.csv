@@ -1,5 +1,0 @@
-code,lambda,alpha,topm,conf_topk,warmup_epochs,seed,accuracy
-CS3000_carrot_warmup_epochs5_carrot_conf_topk10,0.2,20,40,10,5,42,0.4458
-CS3001_carrot_warmup_epochs5_carrot_conf_topk20,0.4,20,40,20,5,42,0.4542
-CS3002_carrot_warmup_epochs10_carrot_conf_topk10,0.2,20,40,10,10,42,0.1750
-CS3003_carrot_warmup_epochs10_carrot_conf_topk20,0.4,20,40,20,10,42,0.4708
