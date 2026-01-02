@@ -1,9 +1,9 @@
 #!/bin/bash
 #PBS -P yp87
-#PBS -q gpuvolta
+#PBS -q gpuhopper
 #PBS -l ngpus=1
 #PBS -l ncpus=12
-#PBS -l mem=8GB
+#PBS -l mem=16GB
 #PBS -l walltime=02:45:00
 #PBS -l wd
 #PBS -l storage=scratch/yp87
@@ -16,9 +16,9 @@ export HF_HUB_OFFLINE=1
 
 cd ../..
 python3 -u src/main.py \
-  --dataset cotton80 --data_root ./data \
-  --model resnet50.a1_in1k --pretrained \
+  --dataset cub_200_2011 --data_root ./data \
+  --model vit_base_patch16_dinov3 --pretrained \
   --epochs 280 \
-  --batch_size 16 --num_workers 0 \
+  --batch_size 120 --num_workers 0 \
   --img_size 256 \
-  --seed 42 >> T014.log 2>&1
+  --seed 42 >> BS009.log 2>&1
