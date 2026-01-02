@@ -1,5 +1,5 @@
 code,backbone,batch_size,accuracy
 B000,vit_base_patch16_dinov3,64,?
 B001,vit_base_patch16_dinov3,128,?
-B002,vit_base_patch16_dinov3,256,?
-B003,vit_base_patch16_dinov3,512,?
+B002,vit_base_patch16_dinov3,256,0.5208
+B003,vit_base_patch16_dinov3,512,0.1750
