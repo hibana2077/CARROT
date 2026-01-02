@@ -19,7 +19,7 @@ python3 -u src/main.py \
   --dataset cotton80 --data_root ./data \
   --model vit_base_patch16_dinov3 --pretrained \
   --epochs 280 \
-  --batch_size 16 --num_workers 0 \
+  --batch_size 256 --num_workers 0 \
   --img_size 288 \
   --use_carrot \
   --carrot_lambda 0.4 --carrot_alpha 10 --carrot_topm 20 --carrot_conf_topk 20 --carrot_warmup_epochs 10 \
