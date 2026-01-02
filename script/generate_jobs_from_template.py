@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate PBS job scripts by sweeping carrot_alpha and carrot_topm.
+"""Generate PBS job scripts by sweeping parameter combinations.
 
 This script takes an existing job script as a template (e.g. script/C/S2/CS2000.sh)
-and produces multiple scripts where ONLY these flags are changed:
+and produces multiple scripts where ONLY the specified flags are changed.
 
-- --carrot_alpha
-- --carrot_topm
+You can sweep any flags by repeating `--sweep`:
+    --sweep carrot_alpha=5,10,20 --sweep carrot_topm=10,20,40
 
 It also updates the log filename in the redirection (>> ... 2>&1) to avoid collisions.
 
@@ -22,15 +22,20 @@ import re
 from pathlib import Path
 
 
-_ALPHA_RE = re.compile(r"(--carrot_alpha\s+)(\d+)(\b)")
-_TOPM_RE = re.compile(r"(--carrot_topm\s+)(\d+)(\b)")
 _LOG_RE = re.compile(r"(>>\s*)([^\s]+\.log)(\s+2>&1)")
 
 
-def _replace_flag(script_text: str, pattern: re.Pattern[str], new_value: int, flag_name: str) -> str:
+def _flag_pattern(flag: str) -> re.Pattern[str]:
+    # Matches: --flag <value>
+    # Value can be int or float (and scientific notation) since templates may vary.
+    return re.compile(rf"(--{re.escape(flag)}\s+)([^\s\\]+)(\b)")
+
+
+def _replace_flag(script_text: str, flag: str, new_value: str) -> str:
+    pattern = _flag_pattern(flag)
     match = pattern.search(script_text)
     if not match:
-        raise ValueError(f"Cannot find {flag_name} in template.")
+        raise ValueError(f"Cannot find --{flag} in template.")
     return pattern.sub(lambda m: f"{m.group(1)}{new_value}{m.group(3)}", script_text, count=1)
 
 
@@ -44,8 +49,7 @@ def _replace_log(script_text: str, new_log_name: str) -> str:
 def generate_scripts(
     template_path: Path,
     out_dir: Path,
-    alphas: list[int],
-    topms: list[int],
+    sweeps: list[tuple[str, list[str]]],
     overwrite: bool,
 ) -> list[Path]:
     template_text = template_path.read_text(encoding="utf-8")
@@ -53,13 +57,17 @@ def generate_scripts(
     created: list[Path] = []
     base_name = template_path.stem  # e.g. CS2000
 
-    for alpha, topm in itertools.product(alphas, topms):
-        out_stem = f"{base_name}_a{alpha}_m{topm}"
+    sweep_flags = [name for name, _values in sweeps]
+    sweep_values = [_values for _name, _values in sweeps]
+
+    for combo in itertools.product(*sweep_values):
+        suffix = "_".join(f"{flag}{val}" for flag, val in zip(sweep_flags, combo))
+        out_stem = f"{base_name}_{suffix}" if suffix else base_name
         out_path = out_dir / f"{out_stem}.sh"
 
         script_text = template_text
-        script_text = _replace_flag(script_text, _ALPHA_RE, alpha, "--carrot_alpha")
-        script_text = _replace_flag(script_text, _TOPM_RE, topm, "--carrot_topm")
+        for flag, val in zip(sweep_flags, combo):
+            script_text = _replace_flag(script_text, flag, val)
         script_text = _replace_log(script_text, f"{out_stem}.log")
 
         if out_path.exists() and not overwrite:
@@ -86,16 +94,13 @@ def main() -> int:
         help="Output directory (default: same directory as template)",
     )
     parser.add_argument(
-        "--alphas",
-        type=str,
-        default="5,10,20",
-        help="Comma-separated list of alpha values (default: 5,10,20)",
-    )
-    parser.add_argument(
-        "--topms",
-        type=str,
-        default="10,20,40",
-        help="Comma-separated list of topm values (default: 10,20,40)",
+        "--sweep",
+        action="append",
+        default=None,
+        help=(
+            "Repeatable. Format: flag=v1,v2,... (flag name WITHOUT leading --). "
+            "Example: --sweep carrot_alpha=5,10,20 --sweep carrot_topm=10,20,40"
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -112,14 +117,30 @@ def main() -> int:
     out_dir: Path = args.out_dir if args.out_dir is not None else template_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    alphas = [int(x.strip()) for x in args.alphas.split(",") if x.strip()]
-    topms = [int(x.strip()) for x in args.topms.split(",") if x.strip()]
+    if args.sweep is None:
+        # Backward-compatible default behavior
+        sweeps: list[tuple[str, list[str]]] = [
+            ("carrot_alpha", ["5", "10", "20"]),
+            ("carrot_topm", ["10", "20", "40"]),
+        ]
+    else:
+        sweeps = []
+        for item in args.sweep:
+            if "=" not in item:
+                raise ValueError(f"Invalid --sweep '{item}'. Expected flag=v1,v2,...")
+            flag, values_csv = item.split("=", 1)
+            flag = flag.strip()
+            if not flag:
+                raise ValueError(f"Invalid --sweep '{item}': empty flag")
+            values = [v.strip() for v in values_csv.split(",") if v.strip()]
+            if not values:
+                raise ValueError(f"Invalid --sweep '{item}': no values")
+            sweeps.append((flag, values))
 
     created = generate_scripts(
         template_path=template_path,
         out_dir=out_dir,
-        alphas=alphas,
-        topms=topms,
+        sweeps=sweeps,
         overwrite=args.overwrite,
     )
 
