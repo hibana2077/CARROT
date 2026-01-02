@@ -1,0 +1,11 @@
+code,backbone,batch_size,accuracy
+BS000,swinv2_tiny_window16_256.ms_in1k,16,?
+BS001,swinv2_tiny_window16_256.ms_in1k,32,?
+BS002,swinv2_tiny_window16_256.ms_in1k,64,?
+BS003,swinv2_tiny_window16_256.ms_in1k,96,?
+BS004,swinv2_tiny_window16_256.ms_in1k,120,?
+BS005,vit_base_patch16_dinov3,16,?
+BS006,vit_base_patch16_dinov3,32,?
+BS007,vit_base_patch16_dinov3,64,?
+BS008,vit_base_patch16_dinov3,96,?
+BS009,vit_base_patch16_dinov3,120,?
