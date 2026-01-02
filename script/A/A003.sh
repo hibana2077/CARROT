@@ -3,7 +3,7 @@
 #PBS -q gpuvolta
 #PBS -l ngpus=1
 #PBS -l ncpus=12
-#PBS -l mem=16GB
+#PBS -l mem=10GB
 #PBS -l walltime=12:45:00
 #PBS -l wd
 #PBS -l storage=scratch/yp87
@@ -22,8 +22,8 @@ python3 -u src/main.py \
   --batch_size 16 --num_workers 0 \
   --img_size 288 \
   --use_carrot \
-  --carrot_lambda 0.05 --carrot_alpha 10 --carrot_topm 20 --carrot_conf_topk 20 --carrot_warmup_epochs 10 \
-  --seed 42 >> A001.log 2>&1
+  --carrot_lambda 0.2 --carrot_alpha 10 --carrot_topm 20 --carrot_conf_topk 20 --carrot_warmup_epochs 10 \
+  --seed 42 >> A003.log 2>&1
 
 
 # lambda ∈ {0.02, 0.05, 0.1, 0.2, 0.4}

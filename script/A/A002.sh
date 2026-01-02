@@ -1,10 +1,10 @@
 #!/bin/bash
 #PBS -P yp87
-#PBS -q gpuhopper
+#PBS -q gpuvolta
 #PBS -l ngpus=1
 #PBS -l ncpus=12
 #PBS -l mem=10GB
-#PBS -l walltime=02:45:00
+#PBS -l walltime=12:45:00
 #PBS -l wd
 #PBS -l storage=scratch/yp87
 
