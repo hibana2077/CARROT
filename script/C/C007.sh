@@ -19,7 +19,7 @@ python3 -u src/main.py \
   --dataset cotton80 --data_root ./data \
   --model tiny_vit_21m_512.dist_in22k_ft_in1k --pretrained \
   --epochs 1000 \
-  --batch_size 256 --num_workers 0 \
+  --batch_size 64 --num_workers 0 \
   --img_size 512 \
   --use_carrot \
   --carrot_lambda 0.2 --carrot_alpha 20 --carrot_topm 40 --carrot_conf_topk 20 --carrot_warmup_epochs 10 \
