@@ -3,8 +3,8 @@
 #PBS -q gpuhopper
 #PBS -l ngpus=1
 #PBS -l ncpus=12
-#PBS -l mem=10GB
-#PBS -l walltime=01:45:00
+#PBS -l mem=9GB
+#PBS -l walltime=00:55:00
 #PBS -l wd
 #PBS -l storage=scratch/yp87
 
@@ -22,8 +22,8 @@ python3 -u src/main.py \
   --batch_size 256 --num_workers 0 \
   --img_size 256 \
   --use_carrot \
-  --carrot_lambda 0.4 --carrot_alpha 10 --carrot_topm 20 --carrot_conf_topk 20 --carrot_warmup_epochs 10 \
-  --seed 42 >> C004.log 2>&1
+  --carrot_lambda 0.2 --carrot_alpha 5 --carrot_topm 20 --carrot_conf_topk 20 --carrot_warmup_epochs 10 \
+  --seed 42 >> CS2000_a5_m20.log 2>&1
 
-
-# lambda ∈ {0.02, 0.05, 0.1, 0.2, 0.4}
+# alpha ∈ {5, 10, 20}
+# topm ∈ {10, 20, 40}
