@@ -64,13 +64,27 @@ def train_one_epoch(
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(images)
+        # NOTE: When CARROT is enabled, avoid a second forward pass for feature extraction.
+        # timm models typically expose forward_features + forward_head.
+        feats: Optional[torch.Tensor] = None
+        if carrot is not None and hasattr(model, "forward_features") and hasattr(model, "forward_head"):
+            feats_all = model.forward_features(images)
+            logits = model.forward_head(feats_all)
+            # pooled feature vector for CARROT prototypes
+            try:
+                feats = model.forward_head(feats_all, pre_logits=True)
+            except TypeError:
+                feats = feats_all
+        else:
+            logits = model(images)
 
         loss_ce = criterion(logits, targets)
 
         loss_carrot = None
         if carrot is not None:
-            feats = extract_timm_features(model, images)
+            if feats is None:
+                feats = extract_timm_features(model, images)
+
             feats = F.normalize(feats, dim=-1)
 
             # Always update EMA stats when CARROT is enabled
