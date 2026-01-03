@@ -1,3 +1,5 @@
 backbone,carrot,dataset,acc
 swinv2_tiny_window16_256.ms_in1k,False,cotton80,45.42
 swinv2_tiny_window16_256.ms_in1k,True,cotton80,46.25
+tiny_vit_21m_512.dist_in22k_ft_in1k,False,cotton80,57.92
+tiny_vit_21m_512.dist_in22k_ft_in1k,True,cotton80,57.50
