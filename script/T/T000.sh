@@ -17,8 +17,8 @@ export HF_HUB_OFFLINE=1
 cd ../..
 python3 -u src/main.py \
   --dataset cotton80 --data_root ./data \
-  --model mobilenetv4_conv_medium.e250_r384_in12k_ft_in1k --pretrained \
+  --model swinv2_tiny_window16_256.ms_in1k --pretrained \
   --epochs 1000 \
-  --batch_size 16 --num_workers 0 \
-  --img_size 384 \
-  --seed 42 >> BT000.log 2>&1
+  --batch_size 256 --num_workers 0 \
+  --img_size 256 \
+  --seed 42 >> T000.log 2>&1
