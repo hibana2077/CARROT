@@ -1,8 +1,0 @@
-| model | cotton80 | soybean | cub_200_2011 |
-| --- | --- | --- | --- |
-| vit_base_patch16_dinov3 | 0.0542 | 0.0383 | 0.2710 |
-| tiny_vit_21m_512.dist_in22k_ft_in1k | 0.4583 | 0.3550 | -- |
-| efficientnet_x_b5.sw_r448_e450_in1k | 0.1833 | -- | 0.6053 |
-| swinv2_tiny_window16_256.ms_in1k | -- | -- | -- |
-| resnet50.a1_in1k | -- | -- | -- |
-| vit_base_patch8_224.augreg2_in21k_ft_in1k | -- | -- | -- |
