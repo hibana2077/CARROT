@@ -15,11 +15,11 @@ import timm
 try:
     # When running as a script: `python src/main.py`
     from dataset.ufgvc import UFGVCDataset
-    from carrot import CARROTFeatureAug
+    from models import FGModel  # type: ignore[import-not-found]
 except ModuleNotFoundError:
     # When running as a module: `python -m src.main`
     from .dataset.ufgvc import UFGVCDataset
-    from .carrot import CARROTFeatureAug
+    from .models import FGModel  # type: ignore[import-not-found]
 
 
 def set_seed(seed: int) -> None:
@@ -39,31 +39,6 @@ class EpochStats:
     ece: Optional[float] = None
 
 
-class FGModel(nn.Module):
-    """Backbone + (optional) LayerNorm + linear classifier.
-
-    This wrapper exposes the embedding needed by CARROT.
-    """
-
-    def __init__(self, backbone_name: str, num_classes: int, pretrained: bool = True) -> None:
-        super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
-        d = getattr(self.backbone, "num_features", None)
-        if d is None:
-            with torch.no_grad():
-                x = torch.randn(1, 3, 224, 224)
-                d = int(self.backbone(x).shape[-1])
-
-        self.norm = nn.LayerNorm(d)
-        self.classifier = nn.Linear(d, num_classes, bias=False)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        z = self.backbone(x)  # (B, D)
-        z = self.norm(z)
-        logits = self.classifier(z)
-        return z, logits
-
-
 def _top1_correct(logits: torch.Tensor, targets: torch.Tensor) -> int:
     preds = torch.argmax(logits, dim=1)
     return int((preds == targets).sum().item())
@@ -75,8 +50,6 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     criterion: nn.Module,
-    carrot: Optional[CARROTFeatureAug] = None,
-    carrot_enabled: bool = False,
 ) -> EpochStats:
     model.train()
 
@@ -89,16 +62,8 @@ def train_one_epoch(
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        z, logits = model(images)
-        loss_real = criterion(logits, targets)
-
-        loss = loss_real
-        if carrot_enabled and carrot is not None:
-            z_aug, y_aug = carrot(z, targets, logits, model.classifier.weight)
-            if z_aug is not None:
-                logits_aug = model.classifier(model.norm(z_aug))
-                loss_aug = criterion(logits_aug, y_aug)
-                loss = loss_real + carrot.aug_weight * loss_aug
+        logits = model(images)
+        loss = criterion(logits, targets)
 
         loss.backward()
         optimizer.step()
@@ -164,7 +129,7 @@ def evaluate(
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        _z, logits = model(images)
+        logits = model(images)
         loss = criterion(logits, targets)
         nll_sum = float(F.cross_entropy(logits, targets, reduction="sum").item())
         ece = float(_ece_from_logits(logits, targets).item())
@@ -273,6 +238,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", type=str, default="vit_base_patch16_224")
     p.add_argument("--pretrained", action="store_true")
 
+    # Head
+    p.add_argument(
+        "--head",
+        type=str,
+        default="zzz",
+        choices=["zzz", "linear"],
+        help="Classifier head type (default: zzz)",
+    )
+    p.add_argument("--zzz_rank", type=int, default=8, help="ZZZ head low-rank dimension")
+
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--optimizer", type=str, default="sgd", choices=["sgd", "adamw"])
     p.add_argument("--lr", type=float, default=0.03)
@@ -284,20 +259,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
 
     p.add_argument("--no_download", action="store_true")
-
-    # CARROT
-    p.add_argument("--carrot", action="store_true", help="Enable CARROT feature-space augmentation")
-    p.add_argument("--carrot_topk", type=int, default=10)
-    p.add_argument("--carrot_gamma", type=float, default=0.0)
-    p.add_argument("--carrot_delta", type=float, default=0.05)
-    p.add_argument("--carrot_aug_per_sample", type=int, default=1)
-    p.add_argument("--carrot_aug_weight", type=float, default=1.0)
-    p.add_argument(
-        "--carrot_warmup_epochs",
-        type=int,
-        default=0,
-        help="Warm-up epochs before enabling CARROT (requires --carrot)",
-    )
 
     return p.parse_args()
 
@@ -321,7 +282,13 @@ def main() -> None:
     )
 
     num_classes = len(train_ds.classes)
-    model = FGModel(args.model, num_classes=num_classes, pretrained=args.pretrained)
+    model = FGModel(
+        backbone_name=args.model,
+        num_classes=num_classes,
+        head_type=args.head,
+        zzz_rank=int(args.zzz_rank),
+        pretrained=args.pretrained,
+    )
     model.to(device)
 
     # Rebuild transforms with the actual model when possible (safe if it stays same)
@@ -370,27 +337,14 @@ def main() -> None:
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    carrot = None
-    if args.carrot:
-        carrot = CARROTFeatureAug(
-            topk=args.carrot_topk,
-            gamma=args.carrot_gamma,
-            delta=args.carrot_delta,
-            aug_per_sample=args.carrot_aug_per_sample,
-            aug_weight=args.carrot_aug_weight,
-        ).to(device)
-
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        carrot_active = bool(args.carrot) and (epoch > int(args.carrot_warmup_epochs))
         train_stats = train_one_epoch(
             model,
             train_loader,
             optimizer,
             device,
             criterion,
-            carrot=carrot,
-            carrot_enabled=carrot_active,
         )
         eval_stats = evaluate(model, eval_loader, device, criterion)
         scheduler.step()

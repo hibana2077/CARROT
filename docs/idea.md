@@ -1,171 +1,166 @@
-## 論文題目（縮寫：CARROT）
+## 論文題目（縮寫：ZZZ）
 
-**CARROT: Class-conditional Augmentation via Robust Regularized Optimal Transport for Fine-Grained Visual Recognition**
-（中文可譯：**CARROT：以「魯棒熵正則最適傳輸」做類別條件式擴增的細粒度辨識**）
+**ZZZ: Z-Normalized Z-Subspace Zooming Classifier Head for Fine-Grained Visual Categorization**
 
-> 你的上傳論文（DEFOCA）核心是「用可控的方式增加每類有效樣本數」並強調 *label-safe* 與一般化界線（例如 Psafe 與 PAC-Bayes）。 
-> CARROT 保留「擴充每類樣本」這條主軸，但**不走 patch blur / DEFOCA 路線**；改成一個**全新、可證明的“分佈層級擴增原理”**：把「資料擴增」定義為一個**最適傳輸(OT) + 魯棒/熵正則 + label-safe（margin-chance constraint）**的數學問題。
+一句話：受到 CLA-Net 指出「把同類樣本在表示空間壓得太緊會 overfit、需要更 *soft* 的同類約束」的啟發 ，我提出一個**純分類頭、plug-and-play** 的作法：把每一類不再視為一個點（prototype），而是視為「**帶方向性容忍度的子空間（subspace）**」，用**可解釋的機率模型**把 intra-class variation 變成「允許的方向」，同時維持 inter-class separation。
 
 ---
 
 ## 研究核心問題
 
-在 FGVR（細粒度分類）中，**每類有效可學訊號稀疏、且常被增強/擾動破壞**；我們想要擴增每類樣本數，但同時必須控制「增廣後樣本仍屬於同一類」的風險。上傳論文用「不碰到 discriminative patches」的組合式 Psafe 來談 label-safe。
-**CARROT 的核心問題改寫為：**
+在 FGVC（如 CUB-200-2011）中，類別差異極細、同類內變化又大，若分類頭只用線性/餘弦原型（point prototype），會傾向：
 
-> 能不能在 *feature space* 中，為每個類別學出一個「**最大化多樣性、且在 Wasserstein 距離上不偏離原分佈、並保證分類 margin 的 label-safe 擴增分佈**」？
+* **把同類樣本過度收縮**（tight alignment）→ 訓練集好、測試集掉（overfitting）
+* 對「同類合理的姿態/背景/局部形變」**不夠容忍**
 
 ---
 
 ## 研究目標
 
-1. **對每一類**產生大量「理論上可控、label-safe」的虛擬樣本（feature-level samples），等價於提升每類樣本數。
-2. 以 plug-and-play 模組方式插入任意 FG pipeline（backbone 後、classifier 前），不改架構主幹。
-3. 在 CUB / Cars / NABirds / FGVC-Aircraft 等資料集上，以同 backbone 設定下**Top-1 Acc 超越現有最強 baseline / 已公開 SOTA**（目標）。
+1. 設計一個**可直接替換 Linear/ Cosine classifier 的分類頭**（不改 backbone、不靠額外標註、不引入 CLA-Net 的 Lie algebra/對比模組）。
+2. 讓分類邊界同時具備：
+
+   * **大類間距**（inter-class separation）
+   * **方向性類內容忍**（intra-class tolerance *by design*）
+3. 提供**明確理論詮釋**（等價於低秩共變異高斯的貝氏判別）與可證性質。
 
 ---
 
-## 貢獻（Contributions）
+## 貢獻
 
-1. **新定義：**把「資料擴增」形式化成**類別條件式的 Wasserstein-魯棒擴增分佈學習問題**（不是 A 技術 + B 技術，而是一個單一理論目標函數）。([arXiv][1])
-2. **可證明 label-safe：**用 *margin chance constraint*（以機率保證不跨類）取代 DEFOCA 的 patch-combinatorics；更通用、更接近分類決策本身。
-3. **封閉解 / 可計算解：**在「Gaussian 近似 + 二次成本」下推導出**最優擴增協方差只在“非判別子空間”膨脹**的解析形式（可視為“理論導出的最安全多樣性注入”）。
-4. **一般化洞見：**把 CARROT 連到 Wasserstein DRO 的「正則化等價」：擴增其實是在做一種 data-dependent regularization，解釋為何能縮小 generalization gap。([arXiv][2])
-
----
-
-## 創新（不是工程拼裝，而是理論創新）
-
-**一句話：**CARROT 把「擴增」定義成一個**受約束的最大熵最適傳輸問題**：
-
-* **OT / Wasserstein**：確保擴增後分佈不會偏離原類別太遠（真實性）。([nowpublishers.com][3])
-* **熵正則（Sinkhorn 視角）**：在可控偏離下最大化多樣性（真正“擴充樣本數”的數學化）。([marcocuturi.net][4])
-* **Margin chance constraint**：用機率保證 label-safe（直接對分類決策負責）。
+* **(C1) Plug-and-play head**：只換 head，就能在 ResNet/ViT/DeiT 等 backbone 上用。
+* **(C2) 方向性容忍的判別規則**：把「同類變化」建模成子空間，避免把所有同類都壓成同一個點。
+* **(C3) 可計算、可證明、可解釋**：log-likelihood logits、Woodbury 低秩逆矩陣、明確的穩定性與容忍度命題。 ([維基百科][1])
+* **(C4) 小樣本穩健性**：引入 shrinkage（類似 Ledoit–Wolf 的精神）讓類別共變異估計更 well-conditioned。 ([ScienceDirect][2])
 
 ---
 
-## 理論洞見（你可以寫在 Introduction/Theory 的核心主張）
+## 創新
 
-上傳論文用 Psafe → representation drift → expected loss → PAC-Bayes bound 串起來。 
-CARROT 提供一個對應版本：
-
-> **“最佳擴增”不是隨機抖動，而是：在 Wasserstein 半徑內，找到熵最大的類別分佈；但只允許在不影響分類 margin 的子空間增加變異。**
-> 這會自然導出：**擴增只擾動 nuisance factors（姿態/背景/光照等在 feature space 的非判別方向），避免破壞細粒度 cue。**
+**把「soft constraint」放到分類頭的幾何上，而不是放到 representation learning 的對比/流形模組。**
+對照既有「二階特徵」常見於 bilinear pooling（外積特徵） ([CVF 開放存取][3])，ZZZ 不做重型二階展開，而是用**低秩子空間 + 封閉形式的似然 logits**，做到更輕、更像“頭”。
 
 ---
 
-## 方法論（Methodology，Plug-and-play 元件）
+## 理論洞見（你可以主打的敘事）
 
-### Pipeline 插入點
+> 在 FGVC，真正需要的不是「同類都要非常近」，而是「同類沿著某些 nuisance directions 可以遠一點，但在 discriminative directions 必須近」。
 
-影像 → backbone 取特徵 (z=g_\theta(x)) → **CARROT 模組生成 (\tilde{z})** → classifier 做 CE loss。
+ZZZ 用每一類的「變異子空間」把 nuisance directions 顯式化：
 
-### CARROT 的分佈層級定義（核心目標函數）
+* 子空間方向給 **高容忍（低懲罰）**
+* 子空間外方向給 **高敏感（高懲罰）**
 
-對每一類 (y)，令經驗分佈 (\hat P_y)（由訓練特徵組成）。定義擴增分佈 (Q_y) 為：
+---
 
+## 方法論（ZZZ Head）
+
+### 1) 介面（plug-and-play）
+
+輸入：backbone 最後一層特徵向量 (f\in\mathbb{R}^d)
+先做 **Z-Normalized**：(x=\frac{f}{|f|})（可選擇加 BN/LayerNorm）。與餘弦分類頭思路一致，利於 margin 與穩定性 ([arXiv][4])
+
+### 2) 每類參數（Z-Subspace）
+
+對每一類 (c) 學：
+
+* 均值原型 (\mu_c\in\mathbb{S}^{d-1})
+* 正交基底 (U_c\in\mathbb{R}^{d\times r})，滿足 (U_c^\top U_c=I_r)（Stiefel manifold）
+* 方向性變異尺度 (v_c\in\mathbb{R}_+^r) 與 isotropic (\sigma^2)
+
+定義低秩共變異：
 [
-\max_{Q_y};; H(Q_y);-;\lambda W_2^2(Q_y,\hat P_y)
-\quad
-\text{s.t.}\quad
-\Pr_{z\sim Q_y}\Big[\min_{k\neq y}(w_y-w_k)^\top z \ge \gamma \Big]\ge 1-\delta
+\Sigma_c = U_c\mathrm{diag}(v_c)U_c^\top + \sigma^2 I
 ]
 
-* (W_2)：Wasserstein-2 距離（OT）。([nowpublishers.com][3])
-* (H(\cdot))：熵（越大代表越“擴增”）。
-* chance constraint：以機率保證 margin ≥ γ ⇒ label-safe。
+### 3) Logits（Zooming = likelihood-based distance）
 
-### 計算上「簡單可做」的閉式近似（Gaussian + 子空間分解）
-
-用 batch/EMA 估每類特徵高斯近似：(\hat P_y \approx \mathcal N(\mu_y,\Sigma_y))。
-定義判別子空間 (D_y=\mathrm{span}{w_y-w_k}*{k\neq y})，其正交補 (N_y) 是 nuisance 子空間。
-**定理（直覺版）：**最優 (Q_y^*) 的協方差只會在 (N_y) 方向被“最大化”，而在 (D_y) 方向受 margin 約束鉗住。
-實作上可寫成：
+用高斯判別的 log-likelihood 當 logit：
 [
-\tilde z = z + U*{N_y},\epsilon,\quad \epsilon\sim \mathcal N(0,\alpha I)
+s_c(x)= -\frac12 (x-\mu_c)^\top \Sigma_c^{-1}(x-\mu_c) ;-;\frac12\log|\Sigma_c| ;+; b_c
 ]
-其中 (\alpha) 由 chance constraint 解出（見下節）。
+最後做 softmax + cross-entropy。
+
+### 4) 計算效率（Woodbury）
+
+因為 (\Sigma_c) 是「低秩 + 對角」，用 Woodbury 可把逆矩陣降成 (r\times r) 的小逆： ([維基百科][1])
 
 ---
 
-## 數學理論推演與證明（你可以寫成 2–3 個定理）
+## 數學理論推演與證明（可放在 Theory section）
 
-### Theorem 1：Label-safe 機率保證（margin chance constraint）
+### 命題 1（ZZZ 對「同類變化方向」的容忍度）
 
-若 (\epsilon\sim\mathcal N(0,\alpha I))，則對任意 (k\neq y)，
-((w_y-w_k)^\top U_{N_y}\epsilon) 仍是高斯，方差為 (\alpha|(w_y-w_k)^\top U_{N_y}|^2)。
-用高斯 tail bound 可得只要
+令同類樣本 (x' = x + \delta)，把擾動分解成
 [
-\alpha \le \min_{k\neq y}\frac{(m_{y,k}-\gamma)^2}{2|(w_y-w_k)^\top U_{N_y}|^2\log(1/\delta)}
+\delta = U_c a ;+; \delta_\perp,\quad U_c^\top\delta_\perp=0
 ]
-就保證 (\Pr[\min_{k\neq y} (w_y-w_k)^\top \tilde z \ge \gamma]\ge 1-\delta)。
-（這就是 feature-space 版的 label-safe；對比上傳論文的 Psafe 定義，它是 patch-combinatorics，而這裡是 decision-theoretic。）
-
-### Theorem 2：Representation drift 上界（CARROT 版）
-
-若 backbone 在特徵層對輸入擾動近似 Lipschitz（或直接在 feature space 定義 drift），則
+則 Mahalanobis 距離增量滿足（忽略常數）：
 [
-\mathbb E|\tilde z-z|*2^2=\mathbb E|U*{N_y}\epsilon|^2=\alpha\cdot \dim(N_y)
+(x'-\mu_c)^\top \Sigma_c^{-1}(x'-\mu_c)
+=======================================
+
+\underbrace{|\delta_\perp|^2/\sigma^2}*{\text{子空間外：大懲罰}}
++
+\underbrace{\sum*{i=1}^r \frac{a_i^2}{\sigma^2+v_{c,i}}}*{\text{子空間內：若 }v*{c,i}\text{大 → 小懲罰}}
 ]
-給出可控 drift；與上傳論文的「Psafe 控制 drift」對應但路徑完全不同。
+**結論**：學到大的 (v_{c,i}) 就等於「模型承認這是同類合理變化方向」，因此不會強迫所有同類點都貼到一起（soft constraint 直接寫進 decision rule）。
 
-### Theorem 3：一般化洞見（連到 Wasserstein DRO 的正則化等價）
+（證明：用 Woodbury 將 (\Sigma_c^{-1}) 展開，再利用 (\delta) 的正交分解即可。） ([維基百科][1])
 
-Wasserstein DRO 被證明可等價/上界為某些 loss variation / Lipschitz 類型的正則化，解釋了「為何在分佈鄰域內訓練會更泛化」。([arXiv][2])
-CARROT 的 OT+魯棒項可被解讀成：**在每類的 Wasserstein 鄰域內做最壞情況控制，同時用熵最大化確保樣本多樣性**。
+### 命題 2（退化情況包含常見 cosine head）
 
----
+當 (r=0)（沒有子空間）且 (\sigma^2) 固定時，
+[
+s_c(x)\propto -|x-\mu_c|^2 \propto \mu_c^\top x
+]
+等價於**餘弦相似度分類頭**（Normalized softmax / cosine classifier），與 NormFace 的幾何觀點一致。 ([arXiv][4])
 
-## 預計使用 dataset（FG）
+### 命題 3（小樣本穩健：Shrinkage 讓 (\Sigma_c) 可逆且好條件）
 
-* **CUB-200-2011**（200 類、11,788 張）。([CaltechAUTHORS][5])
-* **Stanford Cars**（196 類、16,185 張）。([CV Foundation][6])
-* **NABirds**（555 類、48,562 張）。([CVF Open Access][7])
-* **FGVC-Aircraft**（100 類、10,000 張）。([arXiv][8])
-  你上傳論文也採用這四個 FG benchmark，並列了標準 split 統計。
-
----
-
-## 與現有研究之區別（你可以直接寫在 Related Work 最後一段）
-
-1. **不同於資料空間擴增（CutMix/SnapMix/DEFOCA）：**CARROT 不在像素/patch 做操作；而是定義「類別分佈的最優擴增」並提供機率 label-safe 保證（決策層級）。
-2. **不同於 ISDA/類高斯特徵擾動：**CARROT 的擾動尺度不是 heuristic，而是由 **OT+最大熵+margin chance constraint** 解出，且只在 nuisance 子空間膨脹（理論導出）。
-3. **不同於“加一個 attention/part model”：**CARROT 是 plug-in 的訓練分佈模組，不依賴額外標註與特定架構。
+對 (v_c) 做 shrinkage：
+[
+v_c \leftarrow (1-\rho)v_c + \rho \bar v
+]
+可視為把每類共變異往「共享目標」收縮以降低估計方差，類似 Ledoit–Wolf 在高維小樣本下提升可逆性與準確度的核心精神。 ([ScienceDirect][2])
 
 ---
 
-## Experiment 設計（確保能衝 SOTA 的配置）
+## 預計使用 dataset
 
-### Baselines
-
-* Vanilla training（同 backbone/同超參數）。
-* 強擴增（RandAug/AutoAug 等）+ Mixup/CutMix/SnapMix（你可挑 2–3 個代表）。
-* feature augmentation 類（如 class-covariance augmentation）當作直接對照。
-* 上傳論文 DEFOCA 可作為“同樣主軸（擴增每類樣本）但不同道路”的比較。
-
-### 核心 ablation（一定要做，才能凸顯“理論驅動”）
-
-1. **只用 OT 距離、不用熵** vs **OT+熵（CARROT）**：驗證“最大熵＝有效擴增”。([marcocuturi.net][4])
-2. **不做子空間分解** vs **只在 nuisance 子空間擾動**：驗證“只擴 nuisance 才不傷細粒度 cue”。
-3. (\gamma,\delta,\lambda) 的敏感度曲線（理論上可預測：(\delta) 越小 ⇒ (\alpha) 越小 ⇒ drift 越小）。
-4. 額外：量化 *label violation rate*（擴增後被 classifier 判成其他類的比例）作為 empirical Psafe 對照（呼應你上傳論文的 Psafe 概念，但在新框架下）。
-
-### 評估指標
-
-* Top-1 Acc（主）。
-* Calibration / NLL（若你想凸顯“chance constraint”對可靠性也有幫助）。
-* 特徵空間可視化（t-SNE/UMAP）+ 類內散度/類間 margin 變化（支撐理論）。
+* **CUB-200-2011**（主實驗） ([vision.caltech.edu][5])
+* 可加：Stanford Cars、FGVC-Aircraft（驗證泛化到不同 FGVC 類型）
 
 ---
 
-如果你要我把上面 CARROT 的 **定理敘述 + 證明寫成論文可直接貼的 LaTeX（含符號一致、假設條件、proof sketch）**，我也可以直接幫你排成一個「Theory」章節的完整版本。
-（你上傳的論文檔案：）
+## 與現有研究之區別（你可以寫得很清楚）
 
-[1]: https://arxiv.org/abs/1505.05116?utm_source=chatgpt.com "Data-driven Distributionally Robust Optimization Using the Wasserstein Metric: Performance Guarantees and Tractable Reformulations"
-[2]: https://arxiv.org/abs/1712.06050?utm_source=chatgpt.com "Wasserstein Distributionally Robust Optimization and ..."
-[3]: https://www.nowpublishers.com/article/DownloadSummary/MAL-073?utm_source=chatgpt.com "Computational Optimal Transport"
-[4]: https://marcocuturi.net/Papers/cuturi13sinkhorn.pdf?utm_source=chatgpt.com "Sinkhorn Distances: Lightspeed Computation of Optimal ..."
-[5]: https://authors.library.caltech.edu/records/cvm3y-5hh21?utm_source=chatgpt.com "The Caltech-UCSD Birds-200-2011 Dataset"
-[6]: https://www.cv-foundation.org/openaccess/content_iccv_workshops_2013/W19/html/Krause_3D_Object_Representations_2013_ICCV_paper.html?utm_source=chatgpt.com "3D Object Representations for Fine-Grained Categorization"
-[7]: https://openaccess.thecvf.com/content_cvpr_2015/html/Horn_Building_a_Bird_2015_CVPR_paper.html?utm_source=chatgpt.com "CVPR 2015 Open Access Repository"
-[8]: https://arxiv.org/abs/1306.5151?utm_source=chatgpt.com "Fine-Grained Visual Classification of Aircraft"
+* vs **ArcFace / CosFace / margin-softmax**：它們主要在角度空間加 margin（仍是「每類一個點」的決策幾何）。ZZZ 改的是**每類決策集合從點變成子空間**，直接把 intra-class variation 變成模型的一部分。 ([CVF 開放存取][6])
+* vs **Bilinear/二階 pooling**：它們用外積顯式建二階特徵，維度重；ZZZ 用**低秩共變異**把二階資訊壓在 head 的參數結構裡，更像“head”。 ([CVF 開放存取][3])
+* vs **CLA-Net**：CLA-Net 把 soft constraint 放在 Lie algebra 的對比式表示學習模組；ZZZ **不做 Lie algebra、不做對比學習**，而是把 soft constraint 做成**可證的判別 head 幾何**。 
+* 優化層面：ZZZ 需要 (U_c^\top U_c=I)，可用 Stiefel manifold 的 Cayley/riemannian 方法做高效正交約束更新。 ([web.engr.oregonstate.edu][7])
+
+---
+
+## Experiment 設計
+
+### Baselines（一定要比）
+
+1. Linear softmax head
+2. Cosine classifier（Normalized softmax / NormFace-style） ([arXiv][4])
+3. ArcFace / CosFace（分類頭層級強基線） ([CVF 開放存取][6])
+
+### 主要對照（你要證明的點）
+
+* **泛化提升**：Top-1 / Top-5（CUB）
+* **類內容忍真的存在**：在測試集做「nuisance 擾動」評估（遮擋、背景替換、色偏），看 ZZZ 是否比 cosine/margin head 更穩
+* **幾何可視化**：t-SNE/UMAP + 類內散佈分解（沿 (U_c) vs 垂直方向）
+
+### Ablation（讓論文變深）
+
+* 子空間維度 (r\in{0,2,4,8,16})
+* shrinkage (\rho)（或對 (v_c) 的正則權重）
+* 是否共享 (\bar v)（全類共享 vs 分群共享）
+* 是否加「(\mu_c \perp \text{span}(U_c))」的去耦合正則（可提升可辨識性）
+
+---
