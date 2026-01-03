@@ -16,7 +16,7 @@ export HF_HUB_OFFLINE=1
 
 cd ../..
 python3 -u src/main.py \
-  --dataset cub_200_2011 --data_root ./data \
+  --dataset cotton80 --data_root ./data \
   --model swinv2_tiny_window16_256.ms_in1k --pretrained \
   --epochs 1000 \
   --batch_size 256 --num_workers 0 \
