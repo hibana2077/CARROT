@@ -7,14 +7,11 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import timm
 
 from dataset.ufgvc import UFGVCDataset
-
-from carrot import CarrotState, extract_timm_features
 
 
 def set_seed(seed: int) -> None:
@@ -43,15 +40,6 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     criterion: nn.Module,
-    *,
-    carrot: Optional[CarrotState] = None,
-    epoch: int = 1,
-    carrot_lambda: float = 0.0,
-    carrot_alpha: float = 10.0,
-    carrot_topm: int = 20,
-    carrot_conf_topk: int = 0,
-    carrot_warmup_epochs: int = 0,
-    carrot_use_mahalanobis: bool = False,
 ) -> EpochStats:
     model.train()
 
@@ -64,47 +52,9 @@ def train_one_epoch(
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        # NOTE: When CARROT is enabled, avoid a second forward pass for feature extraction.
-        # timm models typically expose forward_features + forward_head.
-        feats: Optional[torch.Tensor] = None
-        if carrot is not None and hasattr(model, "forward_features") and hasattr(model, "forward_head"):
-            feats_all = model.forward_features(images)
-            logits = model.forward_head(feats_all)
-            # pooled feature vector for CARROT prototypes
-            try:
-                feats = model.forward_head(feats_all, pre_logits=True)
-            except TypeError:
-                feats = feats_all
-        else:
-            logits = model(images)
+        logits = model(images)
 
-        loss_ce = criterion(logits, targets)
-
-        loss_carrot = None
-        if carrot is not None:
-            if feats is None:
-                feats = extract_timm_features(model, images)
-
-            feats = F.normalize(feats, dim=-1)
-
-            # Always update EMA stats when CARROT is enabled
-            carrot.update_mu(feats.detach(), targets)
-            carrot.update_conf(logits.detach(), targets, topk=carrot_conf_topk)
-
-            # Apply regularizer after warmup
-            if epoch > int(carrot_warmup_epochs) and carrot_lambda > 0.0:
-                loss_carrot = carrot.carrot_loss_from_batch(
-                    feats,
-                    targets,
-                    alpha=carrot_alpha,
-                    topm=carrot_topm,
-                    use_mahalanobis=carrot_use_mahalanobis,
-                )
-
-        if loss_carrot is None:
-            loss = loss_ce
-        else:
-            loss = loss_ce + float(carrot_lambda) * loss_carrot
+        loss = criterion(logits, targets)
 
         loss.backward()
         optimizer.step()
@@ -251,17 +201,6 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--no_download", action="store_true")
 
-    # CARROT (Chernoff/confusion-aware prototype separation)
-    p.add_argument("--use_carrot", action="store_true")
-    p.add_argument("--carrot_lambda", type=float, default=0.1)
-    p.add_argument("--carrot_alpha", type=float, default=10.0)
-    p.add_argument("--carrot_topm", type=int, default=20)
-    p.add_argument("--carrot_conf_topk", type=int, default=20)
-    p.add_argument("--carrot_mu_momentum", type=float, default=0.05)
-    p.add_argument("--carrot_conf_momentum", type=float, default=0.05)
-    p.add_argument("--carrot_warmup_epochs", type=int, default=1)
-    p.add_argument("--carrot_use_mahalanobis", action="store_true")
-
     return p.parse_args()
 
 
@@ -289,22 +228,6 @@ def main() -> None:
     num_classes = len(train_ds.classes)
     model = timm.create_model(args.model, pretrained=args.pretrained, num_classes=num_classes)
     model.to(device)
-
-    carrot_state: Optional[CarrotState] = None
-    if args.use_carrot:
-        feat_dim = getattr(model, "num_features", None)
-        if feat_dim is None:
-            # Fallback: extract once to infer dim
-            with torch.no_grad():
-                dummy = torch.zeros(1, 3, args.img_size, args.img_size, device=device)
-                feat_dim = int(extract_timm_features(model, dummy).shape[1])
-        carrot_state = CarrotState(
-            num_classes=num_classes,
-            feat_dim=int(feat_dim),
-            device=device,
-            mu_momentum=args.carrot_mu_momentum,
-            conf_momentum=args.carrot_conf_momentum,
-        )
 
     # Rebuild transforms with the actual model when possible (safe if it stays same)
     train_tf, eval_tf = build_transforms(model, img_size=args.img_size)
@@ -360,14 +283,6 @@ def main() -> None:
             optimizer,
             device,
             criterion,
-            carrot=carrot_state,
-            epoch=epoch,
-            carrot_lambda=args.carrot_lambda if args.use_carrot else 0.0,
-            carrot_alpha=args.carrot_alpha,
-            carrot_topm=args.carrot_topm,
-            carrot_conf_topk=args.carrot_conf_topk,
-            carrot_warmup_epochs=args.carrot_warmup_epochs,
-            carrot_use_mahalanobis=args.carrot_use_mahalanobis,
         )
         eval_stats = evaluate(model, eval_loader, device, criterion)
         scheduler.step()
