@@ -23,4 +23,4 @@ python3 -u src/main.py \
   --img_size 256 \
   --carrot --carrot_topk 5 --carrot_gamma 0.0 --carrot_delta 0.1 --carrot_aug_per_sample 1 --carrot_aug_weight 0.5 \
   --carrot_warmup_epochs 200 \
-  --seed 42 >> T001.log 2>&1
+  --seed 42 >> T007.log 2>&1
