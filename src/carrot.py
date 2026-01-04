@@ -50,7 +50,8 @@ def carrot_operator(
         stats: CarrotStats
     """
     assert z.ndim == 2 and y.ndim == 1
-    y = y.to(torch.long)
+    # y = y.to(torch.long)
+    y = y.to(device=z.device, dtype=torch.long, non_blocking=True)
     B, D = z.shape
     device = z.device
 
