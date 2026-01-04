@@ -20,7 +20,7 @@ python3 -u src/main.py \
   --model vit_base_patch8_224.augreg2_in21k_ft_in1k --pretrained \
   --epochs 1000 \
   --batch_size 256 --num_workers 0 \
-  --img_size 256 \
+  --img_size 224 \
   --optimizer adamw \
   --lr 0.0005 \
   --carrot --carrot_k 4 \
