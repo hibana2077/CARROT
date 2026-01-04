@@ -14,31 +14,57 @@ import timm
 
 try:
     # When running as a script: `python src/main.py`
-    from bhat_reg import (
-        ConfusionWeightedBhatReg,
-        FeatureCatcher,
-        default_bhat_layer_paths,
-        resolve_module,
-    )
-    from pk_sampler import PKBatchSampler
-except ModuleNotFoundError:
-    # When running as a module: `python -m src.main`
-    from .bhat_reg import (
-        ConfusionWeightedBhatReg,
-        FeatureCatcher,
-        default_bhat_layer_paths,
-        resolve_module,
-    )
-    from .pk_sampler import PKBatchSampler
-
-try:
-    # When running as a script: `python src/main.py`
     from dataset.ufgvc import UFGVCDataset
-    from models import FGModel  # type: ignore[import-not-found]
 except ModuleNotFoundError:
     # When running as a module: `python -m src.main`
     from .dataset.ufgvc import UFGVCDataset
-    from .models import FGModel  # type: ignore[import-not-found]
+
+
+class TimmFGModel(nn.Module):
+    """timm backbone + head wrapper.
+
+    Returns (logits, z) where z is a per-sample feature vector used for evaluation metrics.
+    """
+
+    def __init__(self, backbone_name: str, num_classes: int, pretrained: bool) -> None:
+        super().__init__()
+        self.model = timm.create_model(backbone_name, pretrained=pretrained, num_classes=int(num_classes))
+
+        # Best-effort for downstream metrics
+        self.num_classes = int(num_classes)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(self.model, "forward_features") and hasattr(self.model, "forward_head"):
+            feats = self.model.forward_features(x)
+            logits = self.model.forward_head(feats, pre_logits=False)
+            z = self._to_feature_vector(feats)
+            return logits, z
+
+        logits = self.model(x)
+        if hasattr(self.model, "forward_features"):
+            feats = self.model.forward_features(x)
+            z = self._to_feature_vector(feats)
+        else:
+            # Fallback: at least keep shapes consistent
+            z = logits.detach()
+        return logits, z
+
+    @staticmethod
+    def _to_feature_vector(feats: torch.Tensor | Tuple | list) -> torch.Tensor:
+        if isinstance(feats, (tuple, list)) and len(feats) > 0:
+            feats = feats[0]
+        if not isinstance(feats, torch.Tensor):
+            raise TypeError("Unsupported features type returned by timm model")
+
+        if feats.dim() == 4:
+            # CNN: [B, C, H, W] -> GAP
+            return feats.mean(dim=(2, 3))
+        if feats.dim() == 3:
+            # ViT: [B, N, C] -> CLS token
+            return feats[:, 0]
+        if feats.dim() == 2:
+            return feats
+        return feats.view(feats.size(0), -1)
 
 
 def set_seed(seed: int) -> None:
@@ -70,14 +96,11 @@ def _top1_correct(logits: torch.Tensor, targets: torch.Tensor) -> int:
 
 
 def train_one_epoch(
-    model: FGModel,
+    model: TimmFGModel,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     criterion: nn.Module,
-    bhat_reg: Optional[ConfusionWeightedBhatReg] = None,
-    catcher: Optional[FeatureCatcher] = None,
-    bhat_eps: float = 1e-6,
 ) -> EpochStats:
     model.train()
 
@@ -85,31 +108,15 @@ def train_one_epoch(
     total_loss = 0.0
     total_correct = 0
 
-    bhat_sum = 0.0
-    bhat_scale_sum = 0.0
-    bhat_batches = 0
-
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-
-        if catcher is not None:
-            catcher.clear()
 
         optimizer.zero_grad(set_to_none=True)
         logits, _z = model(images)
         ce = criterion(logits, targets)
 
-        if bhat_reg is not None and catcher is not None:
-            bhat = bhat_reg(catcher.feats, logits, targets)
-            scale = ce.detach() / (bhat.detach() + float(bhat_eps))
-            loss = ce + scale * bhat
-
-            bhat_sum += float(bhat.detach().item())
-            bhat_scale_sum += float(scale.detach().item())
-            bhat_batches += 1
-        else:
-            loss = ce
+        loss = ce
 
         loss.backward()
         optimizer.step()
@@ -122,9 +129,6 @@ def train_one_epoch(
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
     out = EpochStats(loss=avg_loss, acc=avg_acc)
-    if bhat_batches > 0:
-        out.bhat = bhat_sum / float(bhat_batches)
-        out.bhat_scale = bhat_scale_sum / float(bhat_batches)
     return out
 
 
@@ -228,7 +232,7 @@ def compute_top_k_confusion_pairs_error(
 
 @torch.no_grad()
 def evaluate(
-    model: FGModel,
+    model: TimmFGModel,
     loader: DataLoader,
     device: torch.device,
     criterion: nn.Module,
@@ -283,7 +287,7 @@ def evaluate(
 
         intra_sim, concentration = compute_concentration_metrics(feats, ys)
         balanced_acc = compute_balanced_accuracy(ys, ps)
-        num_classes = int(model.head.out_features)
+        num_classes = int(getattr(model, "num_classes", int(ps.max().item()) + 1))
         top_k_conf_pairs_error = compute_top_k_confusion_pairs_error(ys, ps, num_classes, k=top_k_pairs)
 
     return EpochStats(
@@ -365,22 +369,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_download", action="store_true")
     p.add_argument("--top_k_conf_pairs", type=int, default=20)
 
-    p.add_argument("--bhat", action="store_true", help="Enable confusion-weighted Bhattacharyya regularization")
-    p.add_argument(
-        "--bhat_layers",
-        type=str,
-        default="",
-        help=(
-            "Comma-separated backbone module paths to hook (e.g. 'blocks.8,blocks.10,blocks.11' or "
-            "'layer2.-1,layer3.-1,layer4.-1'). If empty, uses a heuristic default for common timm models."
-        ),
-    )
-    p.add_argument("--bhat_top_m", type=int, default=64)
-    p.add_argument("--bhat_eps", type=float, default=1e-6)
-
-    p.add_argument("--pk", action="store_true", help="Use P*K batch sampling (recommended for --bhat)")
-    p.add_argument("--pk_k", type=int, default=4, help="K samples per class for PK batches")
-
     return p.parse_args()
 
 
@@ -401,7 +389,7 @@ def main() -> None:
     )
 
     num_classes = len(train_ds.classes)
-    model = FGModel(
+    model = TimmFGModel(
         backbone_name=args.model,
         num_classes=num_classes,
         pretrained=bool(args.pretrained),
@@ -421,27 +409,14 @@ def main() -> None:
 
     pin_memory = device.type == "cuda"
 
-    if bool(args.pk):
-        labels = train_ds.get_all_labels()
-        batch_size = int(args.batch_size)
-        k = int(args.pk_k)
-        epoch_length = (int(labels.numel()) // batch_size) * batch_size
-        batch_sampler = PKBatchSampler(labels, batch_size=batch_size, k=k, length_before_new_iter=epoch_length, seed=int(args.seed))
-        train_loader = DataLoader(
-            train_ds,
-            batch_sampler=batch_sampler,
-            num_workers=int(args.num_workers),
-            pin_memory=pin_memory,
-        )
-    else:
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=int(args.batch_size),
-            shuffle=True,
-            num_workers=int(args.num_workers),
-            pin_memory=pin_memory,
-            drop_last=False,
-        )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=int(args.batch_size),
+        shuffle=True,
+        num_workers=int(args.num_workers),
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
     eval_loader = DataLoader(
         eval_ds,
         batch_size=int(args.batch_size),
@@ -469,28 +444,6 @@ def main() -> None:
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(args.epochs))
 
-    catcher: Optional[FeatureCatcher] = None
-    bhat_reg: Optional[ConfusionWeightedBhatReg] = None
-
-    if bool(args.bhat):
-        catcher = FeatureCatcher()
-
-        if str(args.bhat_layers).strip():
-            layer_paths = [s.strip() for s in str(args.bhat_layers).split(",") if s.strip()]
-        else:
-            layer_paths = default_bhat_layer_paths(model.backbone)
-            if not layer_paths:
-                raise ValueError(
-                    "Cannot infer default --bhat_layers for this backbone. "
-                    "Please pass --bhat_layers explicitly (comma-separated module paths)."
-                )
-
-        for pth in layer_paths:
-            mod = resolve_module(model.backbone, pth)
-            catcher.add(mod, pth)
-
-        bhat_reg = ConfusionWeightedBhatReg(layer_names=layer_paths, top_m=int(args.bhat_top_m), eps=float(args.bhat_eps)).to(device)
-
     for epoch in range(1, int(args.epochs) + 1):
         t0 = time.time()
         train_stats = train_one_epoch(
@@ -499,9 +452,6 @@ def main() -> None:
             optimizer,
             device,
             criterion,
-            bhat_reg=bhat_reg,
-            catcher=catcher,
-            bhat_eps=float(args.bhat_eps),
         )
         eval_stats = evaluate(
             model,
@@ -523,12 +473,6 @@ def main() -> None:
             f"test_intra_sim {float(eval_stats.intra_sim):.4f} - "
             f"test_concentration {float(eval_stats.concentration):.4f}"
         )
-
-        if bhat_reg is not None:
-            msg += (
-                f" - train_bhat {float(train_stats.bhat or 0.0):.6f}"
-                f" - train_bhat_scale {float(train_stats.bhat_scale or 0.0):.6f}"
-            )
 
         msg += f" - {elapsed:.1f} seconds"
         print(msg, flush=True)
