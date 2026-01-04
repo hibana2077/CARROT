@@ -14,14 +14,10 @@ import timm
 
 try:
     # When running as a script: `python src/main.py`
-    from carrot import (  # type: ignore[import-not-found]
-        CARROT,
-        grad_balanced_total_loss,
-        logits_grad_balanced_total_loss,
-    )
+    from carrot import CARROT  # type: ignore[import-not-found]
 except ModuleNotFoundError:
     # When running as a module: `python -m src.main`
-    from .carrot import CARROT, grad_balanced_total_loss, logits_grad_balanced_total_loss
+    from .carrot import CARROT
 
 try:
     # When running as a script: `python src/main.py`
@@ -73,7 +69,6 @@ def train_one_epoch(
     device: torch.device,
     criterion: nn.Module,
     carrot: Optional[CARROT] = None,
-    carrot_alpha_mode: str = "z",
 ) -> EpochStats:
     model.train()
 
@@ -103,7 +98,11 @@ def train_one_epoch(
 
         if carrot is not None:
             # CARROT operator (imp.md): expand within-class clouds using in-batch geometry.
-            z_plus, stats = carrot(z, targets)
+            # IMPORTANT: compute operator statistics without building an autograd graph.
+            # Logit-consistency only needs a deterministic transform of z; no second backbone pass.
+            with torch.no_grad():
+                z_plus, stats = carrot(z, targets)
+            z_plus = F.normalize(z_plus, dim=1)
             logits_plus = model.head(z_plus)
 
             # Logit consistency regularization (imp.md): KL( p(z) || p(z_plus) )
@@ -112,17 +111,9 @@ def train_one_epoch(
             q = F.softmax(logits_plus / T, dim=1)
             reg = F.kl_div(log_p, q, reduction="batchmean") * (T * T)
 
-            if carrot_alpha_mode == "logits":
-                loss, alpha = logits_grad_balanced_total_loss(
-                    loss_base,
-                    reg,
-                    logits=logits,
-                    logits_plus=logits_plus,
-                    targets=targets,
-                    T=T,
-                )
-            else:
-                loss, alpha = grad_balanced_total_loss(loss_base, reg, z)
+            # Fixed-weight (alpha=1) logit consistency.
+            loss = loss_base + reg
+            alpha = loss.detach().new_tensor(1.0)
 
             carrot_reg_sum += float(reg.detach().item())
             carrot_reg_batches += 1
@@ -393,13 +384,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_download", action="store_true")
 
     p.add_argument("--carrot", action="store_true", help="Enable CARROT regularizer")
-    p.add_argument(
-        "--carrot_alpha_mode",
-        type=str,
-        default="z",
-        choices=["z", "logits"],
-        help="CARROT alpha balancing: 'z' (exact, slower) or 'logits' (fast approximation)",
-    )
     # Old CARROT args kept for CLI compatibility (no longer used by operator-based CARROT).
     p.add_argument("--carrot_q_hi", type=float, default=0.90)
     p.add_argument("--carrot_q_lo", type=float, default=0.10)
@@ -520,7 +504,6 @@ def main() -> None:
             device,
             criterion,
             carrot=carrot,
-            carrot_alpha_mode=str(args.carrot_alpha_mode),
         )
         eval_stats = evaluate(model, eval_loader, device, criterion)
         scheduler.step()
