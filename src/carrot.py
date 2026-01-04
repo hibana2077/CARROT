@@ -7,6 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import torch._dynamo as _torch_dynamo
+except Exception:  # pragma: no cover
+    _torch_dynamo = None
+
 
 @dataclass
 class CarrotStats:
@@ -50,7 +55,6 @@ def carrot_operator(
         stats: CarrotStats
     """
     assert z.ndim == 2 and y.ndim == 1
-    assert y.device == z.device, (y.device, z.device)
     y = y.to(torch.long)
     B, D = z.shape
     device = z.device
@@ -114,6 +118,11 @@ def carrot_operator(
         m_mean=m_mean,
     )
     return z_plus, stats
+
+
+# Disable TorchDynamo compilation for this operator.
+if _torch_dynamo is not None:
+    carrot_operator = _torch_dynamo.disable(carrot_operator)
 
 
 class CARROT(nn.Module):
