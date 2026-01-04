@@ -50,15 +50,15 @@ def carrot_operator(
         stats: CarrotStats
     """
     assert z.ndim == 2 and y.ndim == 1
-    # y = y.to(torch.long)
-    y = y.to(device=z.device, dtype=torch.long, non_blocking=True)
+    y = y.to(torch.long)
     B, D = z.shape
     device = z.device
 
     # Normalize for stable geometry (imp.md recommendation).
     z = F.normalize(z, dim=1)
 
-    classes, inv = torch.unique(y, sorted=True, return_inverse=True)
+    # classes, inv = torch.unique(y, sorted=True, return_inverse=True)
+    classes, inv = torch.unique(y, sorted=False, return_inverse=True)
     C = int(classes.numel())
 
     # Degenerate: batch accidentally has <2 classes.
