@@ -436,8 +436,13 @@ def main() -> None:
             from pytorch_metric_learning import samplers  # type: ignore
 
             train_labels = train_ds.get_all_labels().tolist()
+            n = len(train_labels)
+            epoch_length = (n // args.batch_size) * args.batch_size
             sampler = samplers.MPerClassSampler(
-                train_labels, m=int(args.carrot_k), batch_size=int(args.batch_size)
+                train_labels,
+                m=int(args.carrot_k),
+                batch_size=int(args.batch_size),
+                length_before_new_iter=epoch_length,
             )
             train_loader = DataLoader(
                 train_ds,
