@@ -45,7 +45,7 @@ class FGModel(nn.Module):
         z = self.backbone(x)
         if self.norm is not None:
             z = self.norm(z)
-        # CARROT assumes stable embedding geometry; keep features on unit sphere.
+        # Keep features on unit sphere for stable geometry.
         z = F.normalize(z, dim=1)
         return z
 

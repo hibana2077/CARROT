@@ -1,263 +1,441 @@
-下面給你一份「**CARROT 核心演算法**」的 **PyTorch 實作引導**（重點放在：**PK batch、類內統計、最近異類 margin、parameter-free 擴張、plug-and-play 正則化**）。我會用你最容易直接搬去跑 NABirds/FGVC 的寫法。
+下面給你一個**可直接落地（PyTorch）**的實作引導：從「抓中間層特徵」→「算每類均值/方差」→「算 confusion-weight」→「算 Bhattacharyya 正則」→「跟 CE 合併（免調 λ）」。
+
+我會以你前面那個 **Confusion-Weighted Bhattacharyya Regularization（多層、中間表徵、parameter-free）**為目標，且用**對角協方差（diag covariance）**做 MVP：穩、快、好 debug。Bhattacharyya distance 的高斯閉式公式可直接用（見 Gaussian case）。([維基百科][1])
 
 ---
 
-## 0) 先把 batch 做對：一定要用「每類固定 K 張」(P×K)
+## 0) 你要做的最小可行版本（MVP）
 
-CARROT 需要在 **同一個 batch 內**估 (\mu_c, r_c, m_c)。如果一堆類在 batch 裡只出現 1 張，(r_c) 會退化、(\gamma_c) 會亂跳。
+**你先照這個版本做，跑起來再加花樣：**
 
-最省事的做法：用 **pytorch-metric-learning 的 `MPerClassSampler`**，它每次迭代會保證每類抽 `m` 張（batch size 是 `m` 的倍數時）。([Kevin Musgrave][1])
+* 抓多個中間層特徵（ResNet 每個 stage 最後一個 block；ViT 選最後 2~4 個 block）
+* 每層特徵：
 
-```python
-# pip install pytorch-metric-learning
-from pytorch_metric_learning import samplers
-from torch.utils.data import DataLoader
-
-m = 4                 # K=4 images/class
-batch_size = 64       # P×K, 例如 16×4
-sampler = samplers.MPerClassSampler(train_labels, m=m, batch_size=batch_size)
-
-loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler,
-                    num_workers=8, pin_memory=True, drop_last=True)
-```
-
-> 小提醒：如果某些類樣本數 < m，sampler 會在 batch 裡複製樣本來補足。([Kevin Musgrave][1])
+  * CNN：`(B,C,H,W)` → GAP → `(B,C)`
+  * ViT：`(B,N,D)` → 取 CLS token → `(B,D)`
+* batch 內每個類別估計：均值 `μ_c`、對角方差 `v_c`（用 sum / sumsq 算）
+* 計算 batch 內**類別對**的 Bhattacharyya distance（diag 版本）
+* 用模型目前的 softmax 估計 confusion weight `α_cd`（detach 掉，停止梯度）([PyTorch Docs][2])
+* 正則 loss：`L_bhat = Σ_{c<d} α_cd * exp(-D_B(c,d))`
+* 最終 loss：**不用 λ**，做自動尺度匹配：
+  `L = L_ce + (L_ce.detach()/(L_bhat.detach()+eps))*L_bhat` ([PyTorch Docs][2])
 
 ---
 
-## 1) CARROT 的核心：在 batch 內算 (\mu_c, r_c, m_c \Rightarrow \gamma_c)，然後做擴張
+## 1) 抓中間層特徵（forward hook）：可行且乾淨
 
-### 1.1 核心公式（你要寫進 paper 的那組）
+PyTorch 官方 `register_forward_hook` 會在該 module forward 後拿到 output。([PyTorch Docs][3])
 
-* centroid：(\mu_c = \frac{1}{n_c}\sum z_i)
-* RMS 半徑：(r_c = \sqrt{\frac{1}{n_c}\sum |z_i-\mu_c|^2})
-* 最近異類 centroid 距離：(m_c = \min_{c'\ne c}|\mu_c-\mu_{c'}|)
-* parameter-free 擴張倍率：(\gamma_c=\max\left(1,\frac{m_c}{2r_c+\varepsilon}\right))
-* 擴張 operator：(T_c(z)=\mu_c+\gamma_c(z-\mu_c))
-
-### 1.2 PyTorch 實作（重點：用 `unique + index_add_`，不要寫 Python loop）
+### 1.1 Hook 寫法（通用）
 
 ```python
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 
-def carrot_operator(z: torch.Tensor, y: torch.Tensor, eps: float = 1e-12,
-                    detach_stats: bool = True):
+class FeatureCatcher:
+    def __init__(self):
+        self.feats = {}       # name -> Tensor
+        self.handles = []
+
+    def _hook(self, name):
+        def fn(module, args, output):
+            self.feats[name] = output
+        return fn
+
+    def add(self, module: nn.Module, name: str):
+        h = module.register_forward_hook(self._hook(name))  # official API :contentReference[oaicite:4]{index=4}
+        self.handles.append(h)
+
+    def clear(self):
+        self.feats.clear()
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+```
+
+### 1.2 ResNet 選層（torchvision 類型）
+
+通常你要的是每個 stage 的最後 block，例如：
+
+```python
+# 假設 model 是 torchvision.models.resnet50(pretrained=...)
+catcher = FeatureCatcher()
+catcher.add(model.layer1[-1], "l1")
+catcher.add(model.layer2[-1], "l2")
+catcher.add(model.layer3[-1], "l3")
+catcher.add(model.layer4[-1], "l4")
+```
+
+### 1.3 ViT（timm 類型）選層
+
+通常 timm 的 ViT 是 `model.blocks[i]`：
+
+```python
+# 例如抓最後 4 個 block
+for i in range(len(model.blocks)-4, len(model.blocks)):
+    catcher.add(model.blocks[i], f"blk{i}")
+```
+
+---
+
+## 2) 把 hook 到的 output 變成向量特徵（B,D）
+
+```python
+def to_vec(feat: torch.Tensor) -> torch.Tensor:
+    # CNN: (B,C,H,W) -> GAP -> (B,C)
+    if feat.dim() == 4:
+        return feat.mean(dim=(2,3))
+    # ViT: (B,N,D) -> CLS -> (B,D)
+    if feat.dim() == 3:
+        return feat[:, 0, :]
+    # 已經是 (B,D)
+    if feat.dim() == 2:
+        return feat
+    raise ValueError(f"Unsupported feat shape: {feat.shape}")
+```
+
+**小技巧（很重要）：**
+
+* AMP 混合精度訓練時，**統計量建議用 fp32** 算（不然 var/log 容易炸）：
+
+```python
+z = to_vec(feat).float()
+```
+
+---
+
+## 3) batch 內每類 μ / diag-σ²（可微、穩定）
+
+這裡要確保：
+
+* 能 backprop 到 feature（所以不要用 numpy）
+* var 不要變成負或 0（用 clamp + eps）
+
+### 3.1 分組 + 可微統計（index_add）
+
+```python
+def class_stats_diag(z: torch.Tensor, y: torch.Tensor, eps: float = 1e-6):
     """
-    z: [B, D] embeddings
-    y: [B] int64 labels
+    z: (B,D) feature
+    y: (B,) int labels (global class ids)
     return:
-      z_plus: [B, D] CARROT-transformed embeddings
-      stats: dict for logging (gamma, r, m)
+      classes: (K,) unique labels
+      mu: (K,D)
+      var: (K,D) diag variance
+      counts: (K,)
+      inv: (B,) mapping each sample -> [0..K-1]
     """
-    assert z.ndim == 2 and y.ndim == 1
-    B, D = z.shape
-    device = z.device
-    y = y.to(torch.long)
-
-    # classes: [C], inv: [B] maps sample -> class-index in [0..C-1]
     classes, inv = torch.unique(y, sorted=True, return_inverse=True)
-    C = classes.numel()
+    K = classes.numel()
+    B, D = z.shape
 
-    # guard: batch accidentally has only 1 class
-    if C < 2:
-        return z, {"gamma": torch.ones(1, device=device), "r": torch.zeros(1, device=device), "m": torch.zeros(1, device=device)}
+    counts = torch.zeros(K, device=z.device, dtype=z.dtype)
+    ones = torch.ones(B, device=z.device, dtype=z.dtype)
+    counts.index_add_(0, inv, ones)  # counts[k] = #samples in class k
 
-    # counts per class: [C]
-    counts = torch.bincount(inv, minlength=C).clamp_min(1)
+    sum_z = torch.zeros(K, D, device=z.device, dtype=z.dtype)
+    sum_z2 = torch.zeros(K, D, device=z.device, dtype=z.dtype)
+    sum_z.index_add_(0, inv, z)
+    sum_z2.index_add_(0, inv, z * z)
 
-    # mu: [C, D]
-    mu = torch.zeros(C, D, device=device, dtype=z.dtype)
-    mu.index_add_(0, inv, z)
-    mu = mu / counts.unsqueeze(1)
+    mu = sum_z / counts[:, None].clamp_min(1.0)
+    var = (sum_z2 / counts[:, None].clamp_min(1.0)) - mu * mu
+    var = var.clamp_min(eps)  # avoid 0/negative
 
-    # within-class diff and RMS radius r: [C]
-    diff = z - mu[inv]
-    sqnorm = (diff * diff).sum(dim=1)  # [B]
-    r2_sum = torch.zeros(C, device=device, dtype=z.dtype)
-    r2_sum.index_add_(0, inv, sqnorm)
-    r = torch.sqrt(r2_sum / counts + eps)  # [C]
-
-    # centroid distances -> m: [C]
-    # dist[c, c'] = ||mu_c - mu_c'||
-    dist = torch.cdist(mu, mu, p=2)  # [C, C]
-    dist.fill_diagonal_(float("inf"))
-    m = dist.min(dim=1).values  # [C]
-
-    gamma = torch.clamp(m / (2.0 * r + eps), min=1.0)  # [C]
-
-    # stability trick: stop-grad the batch statistics
-    if detach_stats:
-        mu = mu.detach()
-        gamma = gamma.detach()
-
-    z_plus = mu[inv] + gamma[inv].unsqueeze(1) * (z - mu[inv])
-
-    return z_plus, {"gamma": gamma, "r": r, "m": m, "classes_in_batch": C}
+    return classes, mu, var, counts, inv
 ```
 
-**為什麼我建議 `detach_stats=True`？**
-因為 (\mu_c, r_c, m_c) 都是 batch 統計量，若讓梯度穿過去，訓練初期容易出現「用統計量互相拉扯」的震盪；先 detach 幾乎都更穩（而且 paper 也好說：operator 用 batch geometry 做 plug-in，不需要學）。
+### 3.2 避免「只有 1 張」的類別害你爆炸
+
+batch 裡很多類可能只出現 1 次（FGVC 常見）。你有兩個可行策略：
+
+**策略 A（最簡單也最穩）**：只在 `count>=2` 的類別上算正則
+
+```python
+mask = counts >= 2
+classes = classes[mask]
+mu = mu[mask]
+var = var[mask]
+```
+
+**策略 B（不想丟掉類）**：讓 `var = var + eps` 並接受它很 noisy（MVP 我建議 A）
 
 ---
 
-## 2) CARROT Regularization：最簡單、最穩的做法（CE + Logit Consistency）
+## 4) Confusion weight α_cd（重點：detach）
 
-這個版本很適合你要的「弱假設、plug-and-play」：
+你要的是「模型現在最容易搞混的 pair」→ 加大正則力道。
+`detach()` 會把張量從計算圖切開，後面不回傳梯度。([PyTorch Docs][2])
 
-* 原 embedding 做正常分類 CE
-* CARROT 後的 embedding，要求 logits 與原本一致（知識蒸餾那套 KL）
+### 4.1 只在 batch 出現的 K 個類別上算 confusion（KxK）
 
 ```python
-def carrot_ce_kl_loss(encoder, classifier, x, y, T: float = 1.0, lam: float = 1.0):
+@torch.no_grad()
+def confusion_alpha(logits: torch.Tensor, y: torch.Tensor, classes: torch.Tensor, inv: torch.Tensor):
     """
-    encoder: backbone -> embeddings
-    classifier: linear head (or any head) -> logits
+    logits: (B,C_total)
+    y: (B,)
+    classes: (K,) unique labels in batch
+    inv: (B,) mapping sample -> [0..K-1]
+    return alpha: (K,K) symmetric, diag=0
     """
-    z = encoder(x)                  # [B, D]
-    z = F.normalize(z, dim=1)       # 建議 normalize，距離/半徑才穩
+    p = torch.softmax(logits, dim=1)              # (B,C_total)
+    pK = p[:, classes]                           # (B,K): prob to batch-present classes
+    B, K = pK.shape
 
-    z_plus, stats = carrot_operator(z, y, detach_stats=True)
-    z_plus = F.normalize(z_plus, dim=1)
+    counts = torch.zeros(K, device=logits.device, dtype=pK.dtype)
+    ones = torch.ones(B, device=logits.device, dtype=pK.dtype)
+    counts.index_add_(0, inv, ones)
 
-    logits = classifier(z)
-    logits_plus = classifier(z_plus)
+    sum_probs = torch.zeros(K, K, device=logits.device, dtype=pK.dtype)
+    sum_probs.index_add_(0, inv, pK)             # row k accumulates probs of samples whose true class is k
 
-    ce = F.cross_entropy(logits, y)
+    mean_probs = sum_probs / counts[:, None].clamp_min(1.0)  # (K,K), mean_probs[k,j] = E_{y=k} p(j)
 
-    # KL( p(z) || p(z_plus) )
-    log_p = F.log_softmax(logits / T, dim=1)
-    q = F.softmax(logits_plus / T, dim=1)
-    kl = F.kl_div(log_p, q, reduction="batchmean") * (T * T)
-
-    loss = ce + lam * kl
-    return loss, stats
+    alpha = 0.5 * (mean_probs + mean_probs.t())
+    alpha.fill_diagonal_(0.0)
+    return alpha
 ```
 
-> 你如果想再硬一點，也可以加一個 `CE(logits_plus, y)` 當 auxiliary，但通常 `CE + KL` 就夠乾淨好用。
+> 為什麼用 `@torch.no_grad()`？
+> 因為 α 只是「當前混淆程度的量測」，你不希望它本身參與梯度路徑，這樣敘事更乾淨（confusion-aware reweighting）。另外 `torch.no_grad()` 的語意是 block 內不建計算圖。([PyTorch Docs][4])
 
 ---
 
-## 3) 想和 SupCon 接：把「z / z_plus」當兩個 view（可選）
+## 5) Bhattacharyya distance（diag covariance）+ coefficient ρ
 
-SupCon 的關鍵是：每個 anchor 會把「同類」當 positives、其他當 negatives。
-你可以把 CARROT 產生的 (z^+) 視為同一個樣本的第二個 view，形成 **2-view supervised contrastive**。
+高斯的 Bhattacharyya distance（多變量）是：
+[
+D_B=\frac18(\mu_1-\mu_2)^T\Sigma^{-1}(\mu_1-\mu_2)+\frac12\log\frac{\det\Sigma}{\sqrt{\det\Sigma_1\det\Sigma_2}}
+]
+其中 (\Sigma=\frac12(\Sigma_1+\Sigma_2))。([維基百科][1])
 
-下面是簡潔版 SupCon（features shape: `[B, V, D]`）：
+對角協方差 (\Sigma=\mathrm{diag}(v)) 時，全部變成 elementwise。
+
+### 5.1 向量化計算（K,K,D → K,K）
 
 ```python
-def supcon_loss(features, labels, temperature=0.1, eps=1e-12):
+def bhattacharyya_diag(mu: torch.Tensor, var: torch.Tensor, eps: float = 1e-6):
     """
-    features: [B, V, D] normalized
-    labels:   [B]
+    mu: (K,D)
+    var: (K,D) positive
+    return:
+      D: (K,K) Bhattacharyya distance (diag cov)
+      rho: (K,K) exp(-D)
     """
-    B, V, D = features.shape
-    device = features.device
-    labels = labels.view(-1, 1)
+    K, D = mu.shape
+    mu_i = mu[:, None, :]            # (K,1,D)
+    mu_j = mu[None, :, :]            # (1,K,D)
+    diff = mu_i - mu_j               # (K,K,D)
 
-    # flatten views
-    feats = features.view(B * V, D)                     # [BV, D]
-    labels = labels.repeat(1, V).view(B * V, 1)         # [BV, 1]
+    var_i = var[:, None, :]          # (K,1,D)
+    var_j = var[None, :, :]          # (1,K,D)
+    var_avg = 0.5 * (var_i + var_j) + eps
 
-    # mask positives: same class, exclude self
-    mask = torch.eq(labels, labels.T).float().to(device)  # [BV, BV]
-    logits = (feats @ feats.T) / temperature              # cosine since normalized
-    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+    # term1 = 1/8 * sum_d (diff^2 / var_avg)
+    term1 = 0.125 * (diff * diff / var_avg).sum(dim=-1)  # (K,K)
 
-    self_mask = torch.ones_like(mask) - torch.eye(B * V, device=device)
-    mask = mask * self_mask
+    # term2 = 1/2 * [ sum log(var_avg) - 1/2(sum log var_i + sum log var_j) ]
+    log_var = torch.log(var + eps)                 # (K,D)
+    log_var_i = log_var[:, None, :].sum(dim=-1)    # (K,1)
+    log_var_j = log_var[None, :, :].sum(dim=-1)    # (1,K)
+    log_var_avg = torch.log(var_avg).sum(dim=-1)   # (K,K)
 
-    exp_logits = torch.exp(logits) * self_mask
-    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + eps)
+    term2 = 0.5 * (log_var_avg - 0.5 * (log_var_i + log_var_j))
+    D = term1 + term2
 
-    mean_log_prob_pos = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + eps)
-    loss = -mean_log_prob_pos.mean()
+    rho = torch.exp(-D)
+    return D, rho
+```
+
+---
+
+## 6) 組合成真正可訓練的正則 loss（含 top-M confusing pairs）
+
+你會遇到一個現實問題：batch 裡若 K=64，pair 是 2016 個；多層會變慢。
+**最穩的做法**：只取 `α_cd` 最大的 top-M pairs（M 固定常數，不當成要調的超參數也可以）。
+
+```python
+def bhat_confusion_loss(mu, var, alpha, top_m: int = 64, eps: float = 1e-6):
+    """
+    mu,var: (K,D)
+    alpha: (K,K), symmetric, diag=0
+    return scalar loss
+    """
+    K = mu.size(0)
+    if K < 2:
+        return mu.new_tensor(0.0)
+
+    _, rho = bhattacharyya_diag(mu, var, eps=eps)  # (K,K)
+
+    # 只取上三角 (i<j)
+    triu = torch.triu_indices(K, K, offset=1, device=mu.device)
+    a = alpha[triu[0], triu[1]]     # (P,)
+    r = rho[triu[0], triu[1]]       # (P,)
+
+    # top-M by alpha
+    if top_m is not None and a.numel() > top_m:
+        vals, idx = torch.topk(a, k=top_m, largest=True)
+        a = vals
+        r = r[idx]
+
+    # normalize：避免 batch composition 影響 loss 尺度
+    denom = a.sum().clamp_min(eps)
+    loss = (a * r).sum() / denom
     return loss
 ```
 
-如何接 CARROT：
+> 注意：`alpha` 請務必是 `detach/no_grad` 來的，不要讓它回傳梯度。([PyTorch Docs][2])
+
+---
+
+## 7) 多層正則 + 免調 λ 的總 loss（完整 training step）
+
+這段是「你照抄就能跑」的版本。
 
 ```python
-z = F.normalize(encoder(x), dim=1)
-z_plus, _ = carrot_operator(z, y, detach_stats=True)
-z_plus = F.normalize(z_plus, dim=1)
+class ConfusionWeightedBhatReg(nn.Module):
+    def __init__(self, layer_names, top_m=64, eps=1e-6):
+        super().__init__()
+        self.layer_names = layer_names
+        self.top_m = top_m
+        self.eps = eps
 
-features = torch.stack([z, z_plus], dim=1)  # [B, 2, D]
-loss = supcon_loss(features, y, temperature=0.1)
+    def forward(self, feats_dict, logits, y):
+        # feats_dict: name -> raw feature tensor (hook captured)
+        total = logits.new_tensor(0.0)
+        used = 0
+
+        for name in self.layer_names:
+            if name not in feats_dict:
+                continue
+
+            z = to_vec(feats_dict[name]).float()   # stats in fp32
+            classes, mu, var, counts, inv = class_stats_diag(z, y, eps=self.eps)
+
+            # 只用 count>=2 的類別（強烈建議）
+            mask = counts >= 2
+            if mask.sum() < 2:
+                continue
+            classes = classes[mask]
+            mu = mu[mask]
+            var = var[mask]
+            # inv 需要重新映射到 mask 後的 K'
+            # 做法：先把原本 inv -> classes[inv] 得到 global label，再重新 unique 一次
+            y2 = classes.new_empty(y.shape)
+            # 這裡用原本 y，直接在 classes 上重新 unique
+            classes2, inv2 = torch.unique(y[torch.isin(y, classes)], sorted=True, return_inverse=True)
+            # 但 logits/feature 對應的是全 batch，為了簡化：直接重算 stats 用 mask 後的 classes
+            # (更乾淨的寫法如下)
+            # => 重新計算 inv2 for whole batch
+            map_dict = {int(c.item()): i for i, c in enumerate(classes.tolist())}
+            inv_full = torch.full_like(y, fill_value=-1, dtype=torch.long)
+            for c, i in map_dict.items():
+                inv_full[y == c] = i
+            keep = inv_full >= 0
+            inv_full = inv_full[keep]
+            z_keep = z[keep]
+            # 重算 μ/var/inv（K'）
+            classes, mu, var, counts, inv = class_stats_diag(z_keep, y[keep], eps=self.eps)
+
+            # alpha (no_grad) on K'
+            with torch.no_grad():  # same effect as detach for the block :contentReference[oaicite:9]{index=9}
+                alpha = confusion_alpha(logits[keep], y[keep], classes, inv)  # (K',K')
+
+            loss_layer = bhat_confusion_loss(mu, var, alpha, top_m=self.top_m, eps=self.eps)
+            total = total + loss_layer
+            used += 1
+
+        if used == 0:
+            return logits.new_tensor(0.0)
+        return total / used
+```
+
+### 7.1 真正的 training loop（含自動尺度匹配）
+
+```python
+reg = ConfusionWeightedBhatReg(layer_names=["l2","l3","l4"], top_m=64).cuda()
+catcher = FeatureCatcher()
+catcher.add(model.layer2[-1], "l2")
+catcher.add(model.layer3[-1], "l3")
+catcher.add(model.layer4[-1], "l4")
+
+ce_fn = nn.CrossEntropyLoss()
+
+for x, y in loader:
+    x, y = x.cuda(), y.cuda()
+    catcher.clear()
+
+    logits = model(x)
+    ce = ce_fn(logits, y)
+
+    bhat = reg(catcher.feats, logits, y)
+
+    # 免調 λ：自動尺度匹配（detach 防止 scale 參與梯度）:contentReference[oaicite:10]{index=10}
+    scale = (ce.detach() / (bhat.detach() + 1e-6))
+    loss = ce + scale * bhat
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
 ```
 
 ---
 
-## 4) 多 GPU (DDP) 的坑：CARROT 的 batch 統計最好「跨 GPU 聚合」
+## 8) 你一定會遇到的坑（我直接給解法）
 
-如果你用 `DistributedDataParallel`，每張 GPU 只看到自己的 local batch。DDP 的設計是每個 process 一份模型、靠 collective communication 同步梯度。([PyTorch 文檔][2])
-**CARROT 的 (\mu, r, m)** 若只用 local batch 算，有時會不穩（尤其每卡的類別組成不一樣）。
+### 坑 A：batch 太小、每類樣本太少 → var 不穩、log 爆掉
 
-最保守做法：**把 embeddings/labels all_gather 起來算統計（不需要梯度）**，再回來 transform local z。
+**解法（推薦順序）**
 
-```python
-import torch.distributed as dist
+1. 只用 `count>=2` 的類別做正則（上面已做）
+2. `var.clamp_min(eps)` + `log(var+eps)`（上面已做）
+3. 若還不穩：把 `top_m` 調小（例如 32）或只在後面兩層做
 
-@torch.no_grad()
-def ddp_all_gather(tensor):
-    world = dist.get_world_size()
-    out = [torch.zeros_like(tensor) for _ in range(world)]
-    dist.all_gather(out, tensor)
-    return torch.cat(out, dim=0)
+### 坑 B：loss 一直是 0 或極小
 
-@torch.no_grad()
-def carrot_stats_global(z_local, y_local, eps=1e-12):
-    z_all = ddp_all_gather(z_local)
-    y_all = ddp_all_gather(y_local)
+常見原因：batch 裡 `count>=2` 的類別很少（FGVC 若用 class-balanced sampler 會好很多）
 
-    classes, inv_all = torch.unique(y_all, sorted=True, return_inverse=True)
-    C = classes.numel()
+* **務實做法**：用 **PK sampler**（每 batch 抽 P 個類，每類 K 張），例如 P=8, K=4（B=32）。這不是你方法的參數，是 data loader 設計，會大幅穩定統計量。
 
-    counts = torch.bincount(inv_all, minlength=C).clamp_min(1)
+### 坑 C：速度慢 / 顯存爆
 
-    mu = torch.zeros(C, z_all.size(1), device=z_all.device, dtype=z_all.dtype)
-    mu.index_add_(0, inv_all, z_all)
-    mu = mu / counts.unsqueeze(1)
+* 先只做 **1~2 個層**（例如 l3、l4）
+* 用 `top_m`（64 或 32）
+* `z` 可以先做 `z = nn.functional.normalize(z, dim=1)`（可減少尺度差異，通常也讓 var 更穩）
 
-    diff = z_all - mu[inv_all]
-    sqnorm = (diff * diff).sum(dim=1)
-    r2_sum = torch.zeros(C, device=z_all.device, dtype=z_all.dtype)
-    r2_sum.index_add_(0, inv_all, sqnorm)
-    r = torch.sqrt(r2_sum / counts + eps)
+### 坑 D：confusion alpha 看起來不合理
 
-    dist_cc = torch.cdist(mu, mu, p=2)
-    dist_cc.fill_diagonal_(float("inf"))
-    m = dist_cc.min(dim=1).values
-    gamma = torch.clamp(m / (2.0 * r + eps), min=1.0)
-
-    return classes, mu, gamma
-```
-
-使用時（local transform）：
-
-```python
-if dist.is_initialized():
-    classes, mu, gamma = carrot_stats_global(z, y)
-    # classes 已排序，可用 searchsorted 對齊
-    inv = torch.searchsorted(classes, y)
-    z_plus = mu[inv] + gamma[inv].unsqueeze(1) * (z - mu[inv])
-```
-
-> `DDP` 怎麼運作與怎麼設置 process group，官方 tutorial 寫得很清楚。([PyTorch 文檔][2])
+* 先把 `alpha` 印出來看 top-10 pair 是否真的對應混淆矩陣高的類別對
+* `alpha` 計算務必在 `no_grad/detach` 之下（避免怪的梯度路徑）([PyTorch Docs][2])
 
 ---
 
-## 5) 你最該盯緊的 5 個「實作成敗點」
+## 9) 你要怎麼驗證「不是空氣」：最硬的三個檢查
 
-1. **一定要 PK/MPerClassSampler**：每類至少 K≥2（建議 K=4）([Kevin Musgrave][1])
-2. **先把 embedding normalize** 再算半徑/距離（不然尺度漂移很嚴重）
-3. **`detach_stats=True`**：訓練穩定度會差很多（特別是前幾個 epoch）
-4. **C 太小就跳過 CARROT**：batch 裡若只有 1 類（理論上 PK 不會，但保險）就直接回傳原 z
-5. **DDP 要考慮 all_gather 統計**（看你跑起來穩不穩，穩就不用）
+1. **Top confusing pairs error rate 明顯下降**
+   在 val 上先算 confusion matrix，找 top-20 pairs，對照 CE baseline 你的方法是否下降。
+2. **ρ（overlap）確實下降**
+   訓練過程 log：`mean(rho_topM)` 應該逐步下降（尤其在後層）。
+3. **中間層線性 probe 更強**
+   固定 backbone，取 l3/l4 特徵訓練 linear classifier：你的方法應該更高。
 
 ---
 
-如果你願意，我也可以直接把上面整理成一個 **可直接丟進你 trainer 的 `CarrotModule(nn.Module)`**（含 logging：平均 (\gamma)、超過 1 的比例、(r/m) 分佈），再附一個最小可跑的 training step 模板（AMP + grad accumulation + DDP 版本）。
+## 10) 理論包裝你可以直接對齊的句子（寫論文用）
 
-[1]: https://kevinmusgrave.github.io/pytorch-metric-learning/samplers/ "Samplers - PyTorch Metric Learning"
-[2]: https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html "Getting Started with Distributed Data Parallel — PyTorch Tutorials 2.9.0+cu128 documentation"
+你要的「可證明敘事」是：**Bhattacharyya bound** 給出二分類 Bayes error 的上界
+[
+P_e \le \sqrt{w_1w_2},\rho(p_1,p_2)
+]
+（ρ 是 Bhattacharyya coefficient / overlap），所以最小化 ρ 是在最小化錯分上界。([Sony CSL][5])
+
+---
+
+[1]: https://en.wikipedia.org/wiki/Bhattacharyya_distance?utm_source=chatgpt.com "Bhattacharyya distance"
+[2]: https://docs.pytorch.org/docs/stable/generated/torch.Tensor.detach.html?utm_source=chatgpt.com "torch.Tensor.detach"
+[3]: https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html "Module — PyTorch 2.9 documentation"
+[4]: https://docs.pytorch.org/docs/stable/generated/torch.no_grad.html?utm_source=chatgpt.com "no_grad — PyTorch 2.9 documentation"
+[5]: https://www2.sonycsl.co.jp/person/nielsen/GenBhatBounds-PRL2014.pdf "Generalized Bhattacharyya and Chernoff upper bounds on Bayes error using quasi-arithmetic means"
