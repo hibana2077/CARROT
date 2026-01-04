@@ -24,5 +24,4 @@ python3 -u src/main.py \
   --optimizer adamw \
   --lr 0.0005 \
   --carrot --carrot_k 4 \
-  --carrot --carrot_alpha_mode logits \
   --seed 42 >> T012.log 2>&1

@@ -384,9 +384,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_download", action="store_true")
 
     p.add_argument("--carrot", action="store_true", help="Enable CARROT regularizer")
-    # Old CARROT args kept for CLI compatibility (no longer used by operator-based CARROT).
-    p.add_argument("--carrot_q_hi", type=float, default=0.90)
-    p.add_argument("--carrot_q_lo", type=float, default=0.10)
     p.add_argument("--carrot_k", type=int, default=4, help="Images per class (K) for PK batches")
 
     return p.parse_args()
