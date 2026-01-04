@@ -314,6 +314,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args = parse_args()
     set_seed(args.seed)
 
