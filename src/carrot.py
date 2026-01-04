@@ -77,21 +77,19 @@ def carrot_operator(
     r = torch.sqrt(r2_sum / counts + eps)  # (C,)
 
     # torch.cdist can be a hotspot; prefer the MM-based euclidean path when available.
-    # try:
-    #     dist_cc = torch.cdist(
-    #         mu,
-    #         mu,
-    #         p=2,
-    #         compute_mode="use_mm_for_euclid_dist_if_necessary",
-    #     )  # (C, C)
-    # except TypeError:
-    #     dist_cc = torch.cdist(mu, mu, p=2)  # (C, C)
-    # dist_cc.fill_diagonal_(float("inf"))
-    # m = dist_cc.min(dim=1).values  # (C,)
-    m = torch.ones(C, device=device, dtype=z.dtype)
+    try:
+        dist_cc = torch.cdist(
+            mu,
+            mu,
+            p=2,
+            compute_mode="use_mm_for_euclid_dist_if_necessary",
+        )  # (C, C)
+    except TypeError:
+        dist_cc = torch.cdist(mu, mu, p=2)  # (C, C)
+    dist_cc.fill_diagonal_(float("inf"))
+    m = dist_cc.min(dim=1).values  # (C,)
 
-    # gamma = torch.clamp(m / (2.0 * r + eps), min=1.0)  # (C,)
-    gamma = torch.ones(C, device=device, dtype=z.dtype)
+    gamma = torch.clamp(m / (2.0 * r + eps), min=1.0)  # (C,)
 
     if detach_stats:
         mu = mu.detach()
