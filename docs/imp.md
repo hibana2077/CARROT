@@ -44,7 +44,7 @@ class CarrotClassifier(nn.Module):
 這裡的 CARROT 正則化完全是 **plug-and-play**：只用 batch 內的 `(embedding z, label y)` 做統計量，回傳兩個 barrier 的 loss。
 
 * **Variance barrier**：類內 trace 太小就用 `-log(r_c)` 爆炸式阻止塌縮
-* **Rank barrier**：用 covariance 的 eigen-spectrum entropy 做 effective rank，再 `-log(erank/d)` 防止只剩低維
+* **Rank barrier**：用 covariance 的 eigen-spectrum entropy 做 effective rank，再用「可達到的最大 rank」做 normalization：`-log(erank / min(d, n-1))`（centered covariance 的 rank 上界是 `n-1`），避免小樣本 class 永遠吃不可能消掉的重刑
 
 > 計算 spectrum 我用 `torch.linalg.svdvals`（對矩陣取 singular values），PyTorch 官方 API。 ([PyTorch Docs][4])
 
@@ -125,7 +125,9 @@ def carrot_regularizer(
 
         # rank barrier
         erank = _effective_rank_from_centered(xc, eps=eps)   # [1, min(n,D)]
-        er_norm = (erank / D).clamp_min(eps)
+        # centered covariance rank upper bound is (n - 1)
+        max_rank = min(D, n - 1)
+        er_norm = (erank / max_rank).clamp_min(eps)
         r_rank_terms.append(-torch.log(er_norm))
 
         min_r = min(min_r, float(r_c.detach().cpu()))

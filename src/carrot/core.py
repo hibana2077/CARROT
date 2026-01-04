@@ -75,7 +75,9 @@ def carrot_regularizer(
 
         # rank barrier
         erank = _effective_rank_from_centered(xc, eps=eps)   # [1, min(n,D)]
-        er_norm = (erank / D).clamp_min(eps)
+        # centered covariance rank upper bound is (n - 1)
+        max_rank = min(D, n - 1)
+        er_norm = (erank / max_rank).clamp_min(eps)
         r_rank_terms.append(-torch.log(er_norm))
 
         min_r = min(min_r, float(r_c.detach().cpu()))
