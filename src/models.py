@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import timm
 
@@ -44,6 +45,8 @@ class FGModel(nn.Module):
         z = self.backbone(x)
         if self.norm is not None:
             z = self.norm(z)
+        # CARROT assumes stable embedding geometry; keep features on unit sphere.
+        z = F.normalize(z, dim=1)
         return z
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

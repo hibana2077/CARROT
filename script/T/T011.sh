@@ -23,5 +23,5 @@ python3 -u src/main.py \
   --img_size 256 \
   --optimizer adamw \
   --lr 0.0005 \
-  --carrot --carrot_q_hi 0.9 --carrot_q_lo 0.1 \
+  --carrot --carrot_k 4 \
   --seed 42 >> T011.log 2>&1

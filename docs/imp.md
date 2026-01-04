@@ -1,212 +1,263 @@
-下面給你一份 **CARROT（同類 soft corridor 約束）** 的「可直接落地」實作引導，重點放在**最容易寫錯/最影響效果**的部分（以 PyTorch 為例）。文中會假設你已經有 baseline（CE / SupCon / ArcFace 類）訓練流程；CARROT 是 **plug-and-play 的 regularizer**，加在 loss 上就好。SupCon 參考 Khosla et al. 的定義即可。 ([NeurIPS 會議論文集][1])
+下面給你一份「**CARROT 核心演算法**」的 **PyTorch 實作引導**（重點放在：**PK batch、類內統計、最近異類 margin、parameter-free 擴張、plug-and-play 正則化**）。我會用你最容易直接搬去跑 NABirds/FGVC 的寫法。
 
 ---
 
-## 0) 你一定要先決定的「插入點」
+## 0) 先把 batch 做對：一定要用「每類固定 K 張」(P×K)
 
-**CARROT 作用在「特徵表示」而不是 logits**：
+CARROT 需要在 **同一個 batch 內**估 (\mu_c, r_c, m_c)。如果一堆類在 batch 裡只出現 1 張，(r_c) 會退化、(\gamma_c) 會亂跳。
 
-* 取 backbone 的 penultimate feature：`feat`（shape: `[B, D]`）
-* **先做 L2 normalize**：`z = normalize(feat)`，然後用 cosine 相似度做走廊（corridor）
-  這跟 SupCon / ArcFace 一樣都常用單位球面幾何（normalized features/weights）。 ([CVF 開放存取][2])
+最省事的做法：用 **pytorch-metric-learning 的 `MPerClassSampler`**，它每次迭代會保證每類抽 `m` 張（batch size 是 `m` 的倍數時）。([Kevin Musgrave][1])
 
-> 重要：如果你不 normalize，cosine corridor 會失真（尺度會被網路任意拉大/縮小），regularizer 會變得不穩定。
+```python
+# pip install pytorch-metric-learning
+from pytorch_metric_learning import samplers
+from torch.utils.data import DataLoader
+
+m = 4                 # K=4 images/class
+batch_size = 64       # P×K, 例如 16×4
+sampler = samplers.MPerClassSampler(train_labels, m=m, batch_size=batch_size)
+
+loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler,
+                    num_workers=8, pin_memory=True, drop_last=True)
+```
+
+> 小提醒：如果某些類樣本數 < m，sampler 會在 batch 裡複製樣本來補足。([Kevin Musgrave][1])
 
 ---
 
-## 1) CARROT 的 forward：算 sim、算走廊、算正則
+## 1) CARROT 的核心：在 batch 內算 (\mu_c, r_c, m_c \Rightarrow \gamma_c)，然後做擴張
 
-### 核心要點（最重要）
+### 1.1 核心公式（你要寫進 paper 的那組）
 
-1. **sim matrix 用 fp32**（尤其 AMP/mixed precision）
-2. **走廊門檻 L/U 要 detach**（門檻不回傳梯度，避免奇怪的 learning dynamics；quantile 本身也不穩）
-3. **要處理「正樣本對太少」的 batch**（FGVC 常遇到：batch 裡某些 class 只有 1 張）
+* centroid：(\mu_c = \frac{1}{n_c}\sum z_i)
+* RMS 半徑：(r_c = \sqrt{\frac{1}{n_c}\sum |z_i-\mu_c|^2})
+* 最近異類 centroid 距離：(m_c = \min_{c'\ne c}|\mu_c-\mu_{c'}|)
+* parameter-free 擴張倍率：(\gamma_c=\max\left(1,\frac{m_c}{2r_c+\varepsilon}\right))
+* 擴張 operator：(T_c(z)=\mu_c+\gamma_c(z-\mu_c))
 
-下面是一個乾淨的 PyTorch 模組骨架：
+### 1.2 PyTorch 實作（重點：用 `unique + index_add_`，不要寫 Python loop）
 
 ```python
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-class CARROT(nn.Module):
-    def __init__(self, q_hi=0.90, q_lo=0.10, eps=1e-8):
-        super().__init__()
-        self.q_hi = q_hi
-        self.q_lo = q_lo
-        self.eps = eps
+def carrot_operator(z: torch.Tensor, y: torch.Tensor, eps: float = 1e-12,
+                    detach_stats: bool = True):
+    """
+    z: [B, D] embeddings
+    y: [B] int64 labels
+    return:
+      z_plus: [B, D] CARROT-transformed embeddings
+      stats: dict for logging (gamma, r, m)
+    """
+    assert z.ndim == 2 and y.ndim == 1
+    B, D = z.shape
+    device = z.device
+    y = y.to(torch.long)
 
-    @torch.no_grad()
-    def _safe_quantile(self, x, q):
-        # x: 1D tensor
-        if x.numel() == 0:
-            return None
-        # torch.quantile is convenient; if you want faster, replace with topk-based approx.
-        return torch.quantile(x, q)
+    # classes: [C], inv: [B] maps sample -> class-index in [0..C-1]
+    classes, inv = torch.unique(y, sorted=True, return_inverse=True)
+    C = classes.numel()
 
-    def forward(self, z, y):
-        """
-        z: [B, D] normalized embeddings (float or half)
-        y: [B] int labels
-        returns: reg_loss (scalar), stats (dict)
-        """
-        B = z.size(0)
-        device = z.device
+    # guard: batch accidentally has only 1 class
+    if C < 2:
+        return z, {"gamma": torch.ones(1, device=device), "r": torch.zeros(1, device=device), "m": torch.zeros(1, device=device)}
 
-        # (1) normalize + fp32 sim
-        z = F.normalize(z, dim=1)
-        sim = (z.float() @ z.float().t()).clamp(-1.0, 1.0)  # [B, B]
+    # counts per class: [C]
+    counts = torch.bincount(inv, minlength=C).clamp_min(1)
 
-        # (2) masks
-        y = y.view(-1, 1)
-        same = (y == y.t())                          # [B, B]
-        eye = torch.eye(B, dtype=torch.bool, device=device)
-        pos_mask = same & (~eye)
-        neg_mask = (~same)
+    # mu: [C, D]
+    mu = torch.zeros(C, D, device=device, dtype=z.dtype)
+    mu.index_add_(0, inv, z)
+    mu = mu / counts.unsqueeze(1)
 
-        pos_sims = sim[pos_mask]  # [num_pos]
-        neg_sims = sim[neg_mask]  # [num_neg]
+    # within-class diff and RMS radius r: [C]
+    diff = z - mu[inv]
+    sqnorm = (diff * diff).sum(dim=1)  # [B]
+    r2_sum = torch.zeros(C, device=device, dtype=z.dtype)
+    r2_sum.index_add_(0, inv, sqnorm)
+    r = torch.sqrt(r2_sum / counts + eps)  # [C]
 
-        # (3) handle degenerate batches
-        if pos_sims.numel() == 0 or neg_sims.numel() == 0:
-            return sim.new_tensor(0.0), {
-                "L": None, "U": None, "num_pos": int(pos_sims.numel()), "num_neg": int(neg_sims.numel())
-            }
+    # centroid distances -> m: [C]
+    # dist[c, c'] = ||mu_c - mu_c'||
+    dist = torch.cdist(mu, mu, p=2)  # [C, C]
+    dist.fill_diagonal_(float("inf"))
+    m = dist.min(dim=1).values  # [C]
 
-        # (4) corridor from negatives (order statistics)
-        q_hi = self._safe_quantile(neg_sims, self.q_hi)
-        q_lo = self._safe_quantile(neg_sims, self.q_lo)
-        # width captures how "spread / confusing" negatives are
-        width = (q_hi - q_lo).clamp_min(0.0)
+    gamma = torch.clamp(m / (2.0 * r + eps), min=1.0)  # [C]
 
-        L = q_hi
-        U = (1.0 - width)
+    # stability trick: stop-grad the batch statistics
+    if detach_stats:
+        mu = mu.detach()
+        gamma = gamma.detach()
 
-        # (5) sanitize corridor
-        L = L.detach()
-        U = U.detach()
-        # ensure U > L; clamp to a sensible range
-        U = torch.clamp(U, min=(L + 1e-3).item(), max=0.999)
+    z_plus = mu[inv] + gamma[inv].unsqueeze(1) * (z - mu[inv])
 
-        # (6) squared hinge penalties for positives falling outside corridor
-        low = F.relu(L - pos_sims)
-        high = F.relu(pos_sims - U)
-        reg = (low * low + high * high).mean()
-
-        stats = {
-            "L": float(L.item()),
-            "U": float(U.item()),
-            "num_pos": int(pos_sims.numel()),
-            "num_neg": int(neg_sims.numel()),
-            "pos_mean": float(pos_sims.mean().item()),
-            "pos_max": float(pos_sims.max().item()),
-            "frac_pos_above_U": float((pos_sims > U).float().mean().item()),
-            "frac_pos_below_L": float((pos_sims < L).float().mean().item()),
-        }
-        return reg, stats
+    return z_plus, {"gamma": gamma, "r": r, "m": m, "classes_in_batch": C}
 ```
+
+**為什麼我建議 `detach_stats=True`？**
+因為 (\mu_c, r_c, m_c) 都是 batch 統計量，若讓梯度穿過去，訓練初期容易出現「用統計量互相拉扯」的震盪；先 detach 幾乎都更穩（而且 paper 也好說：operator 用 batch geometry 做 plug-in，不需要學）。
 
 ---
 
-## 2) Parameter-free 權重 α：梯度平衡（最容易翻車的地方）
+## 2) CARROT Regularization：最簡單、最穩的做法（CE + Logit Consistency）
 
-你之前的設計是 **不用手調 λ**，用「對 embedding 的梯度 norm 比例」做自動配重。這是可行的，但**請用 `autograd.grad` 對 z 取梯度**，並且 `alpha` 要 `.detach()`。
+這個版本很適合你要的「弱假設、plug-and-play」：
+
+* 原 embedding 做正常分類 CE
+* CARROT 後的 embedding，要求 logits 與原本一致（知識蒸餾那套 KL）
 
 ```python
-def grad_balanced_total_loss(loss_base, reg, z, eps=1e-12):
-    # z must be the embedding tensor inside graph (before any detach)
-    g_base = torch.autograd.grad(loss_base, z, retain_graph=True, create_graph=False)[0]
-    g_reg  = torch.autograd.grad(reg,       z, retain_graph=True, create_graph=False)[0]
+def carrot_ce_kl_loss(encoder, classifier, x, y, T: float = 1.0, lam: float = 1.0):
+    """
+    encoder: backbone -> embeddings
+    classifier: linear head (or any head) -> logits
+    """
+    z = encoder(x)                  # [B, D]
+    z = F.normalize(z, dim=1)       # 建議 normalize，距離/半徑才穩
 
-    nb = g_base.norm(p=2)
-    nr = g_reg.norm(p=2)
-    alpha = (nb / (nr + eps)).detach()  # IMPORTANT: detach!
+    z_plus, stats = carrot_operator(z, y, detach_stats=True)
+    z_plus = F.normalize(z_plus, dim=1)
 
-    total = loss_base + alpha * reg
-    return total, alpha
+    logits = classifier(z)
+    logits_plus = classifier(z_plus)
+
+    ce = F.cross_entropy(logits, y)
+
+    # KL( p(z) || p(z_plus) )
+    log_p = F.log_softmax(logits / T, dim=1)
+    q = F.softmax(logits_plus / T, dim=1)
+    kl = F.kl_div(log_p, q, reduction="batchmean") * (T * T)
+
+    loss = ce + lam * kl
+    return loss, stats
 ```
 
-**常見坑：**
-
-* `z` 如果是 `z = z.detach()` 之後才拿來算 reg → reg 根本不會更新 backbone
-* `alpha` 不 detach → 你會在優化一個「比值」的高階效應，訓練可能變怪
+> 你如果想再硬一點，也可以加一個 `CE(logits_plus, y)` 當 auxiliary，但通常 `CE + KL` 就夠乾淨好用。
 
 ---
 
-## 3) 一個完整 training step 長這樣（CE baseline）
+## 3) 想和 SupCon 接：把「z / z_plus」當兩個 view（可選）
+
+SupCon 的關鍵是：每個 anchor 會把「同類」當 positives、其他當 negatives。
+你可以把 CARROT 產生的 (z^+) 視為同一個樣本的第二個 view，形成 **2-view supervised contrastive**。
+
+下面是簡潔版 SupCon（features shape: `[B, V, D]`）：
 
 ```python
-carrot = CARROT(q_hi=0.90, q_lo=0.10).cuda()
+def supcon_loss(features, labels, temperature=0.1, eps=1e-12):
+    """
+    features: [B, V, D] normalized
+    labels:   [B]
+    """
+    B, V, D = features.shape
+    device = features.device
+    labels = labels.view(-1, 1)
 
-# forward
-feat, logits = model(x, return_feat=True)   # 你自己改成抓 penultimate
-z = F.normalize(feat, dim=1)
+    # flatten views
+    feats = features.view(B * V, D)                     # [BV, D]
+    labels = labels.repeat(1, V).view(B * V, 1)         # [BV, 1]
 
-loss_base = F.cross_entropy(logits, y)
+    # mask positives: same class, exclude self
+    mask = torch.eq(labels, labels.T).float().to(device)  # [BV, BV]
+    logits = (feats @ feats.T) / temperature              # cosine since normalized
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
 
-reg, stats = carrot(z, y)
-total, alpha = grad_balanced_total_loss(loss_base, reg, z)
+    self_mask = torch.ones_like(mask) - torch.eye(B * V, device=device)
+    mask = mask * self_mask
 
-optimizer.zero_grad(set_to_none=True)
-total.backward()
-optimizer.step()
+    exp_logits = torch.exp(logits) * self_mask
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + eps)
+
+    mean_log_prob_pos = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + eps)
+    loss = -mean_log_prob_pos.mean()
+    return loss
 ```
 
----
-
-## 4) SupCon / multi-view 時怎麼接（重點：label 要 repeat）
-
-SupCon 的定義本質是把同一張圖的多個 view 當作 batch 裡不同 instance（Khosla et al.）。 ([NeurIPS 會議論文集][1])
-做法：
-
-* `z` shape 可能是 `[B, V, D]`
-* reshape 成 `[B*V, D]`
-* `y` repeat 成 `[B*V]`
-* 然後 CARROT 照算（pos_mask 由 label equality 決定）
+如何接 CARROT：
 
 ```python
-z = z.view(B * V, D)
-y_rep = y.repeat_interleave(V)
-reg, stats = carrot(z, y_rep)
+z = F.normalize(encoder(x), dim=1)
+z_plus, _ = carrot_operator(z, y, detach_stats=True)
+z_plus = F.normalize(z_plus, dim=1)
+
+features = torch.stack([z, z_plus], dim=1)  # [B, 2, D]
+loss = supcon_loss(features, y, temperature=0.1)
 ```
 
 ---
 
-## 6) 你一定要加的 logging（不然 paper 沒靈魂）
+## 4) 多 GPU (DDP) 的坑：CARROT 的 batch 統計最好「跨 GPU 聚合」
 
-每個 epoch（或每 N step）記：
+如果你用 `DistributedDataParallel`，每張 GPU 只看到自己的 local batch。DDP 的設計是每個 process 一份模型、靠 collective communication 同步梯度。([PyTorch 文檔][2])
+**CARROT 的 (\mu, r, m)** 若只用 local batch 算，有時會不穩（尤其每卡的類別組成不一樣）。
 
-* `L, U`
-* `pos_mean, pos_max`
-* `frac_pos_above_U`, `frac_pos_below_L`
-* `alpha`
-  -（選配）`train-test gap`, `ECE/NLL`（校準指標可以依 Guo et al. 的 ECE 定義做 bins）。 ([Proceedings of Machine Learning Research][3])
+最保守做法：**把 embeddings/labels all_gather 起來算統計（不需要梯度）**，再回來 transform local z。
 
-**ECE 實作建議**：直接用 torchmetrics 的 calibration_error 最省事。 ([Lightning AI][4])
+```python
+import torch.distributed as dist
+
+@torch.no_grad()
+def ddp_all_gather(tensor):
+    world = dist.get_world_size()
+    out = [torch.zeros_like(tensor) for _ in range(world)]
+    dist.all_gather(out, tensor)
+    return torch.cat(out, dim=0)
+
+@torch.no_grad()
+def carrot_stats_global(z_local, y_local, eps=1e-12):
+    z_all = ddp_all_gather(z_local)
+    y_all = ddp_all_gather(y_local)
+
+    classes, inv_all = torch.unique(y_all, sorted=True, return_inverse=True)
+    C = classes.numel()
+
+    counts = torch.bincount(inv_all, minlength=C).clamp_min(1)
+
+    mu = torch.zeros(C, z_all.size(1), device=z_all.device, dtype=z_all.dtype)
+    mu.index_add_(0, inv_all, z_all)
+    mu = mu / counts.unsqueeze(1)
+
+    diff = z_all - mu[inv_all]
+    sqnorm = (diff * diff).sum(dim=1)
+    r2_sum = torch.zeros(C, device=z_all.device, dtype=z_all.dtype)
+    r2_sum.index_add_(0, inv_all, sqnorm)
+    r = torch.sqrt(r2_sum / counts + eps)
+
+    dist_cc = torch.cdist(mu, mu, p=2)
+    dist_cc.fill_diagonal_(float("inf"))
+    m = dist_cc.min(dim=1).values
+    gamma = torch.clamp(m / (2.0 * r + eps), min=1.0)
+
+    return classes, mu, gamma
+```
+
+使用時（local transform）：
+
+```python
+if dist.is_initialized():
+    classes, mu, gamma = carrot_stats_global(z, y)
+    # classes 已排序，可用 searchsorted 對齊
+    inv = torch.searchsorted(classes, y)
+    z_plus = mu[inv] + gamma[inv].unsqueeze(1) * (z - mu[inv])
+```
+
+> `DDP` 怎麼運作與怎麼設置 process group，官方 tutorial 寫得很清楚。([PyTorch 文檔][2])
 
 ---
 
-## 7) 你想做「理論對齊」：順手估 \hat{kappa}（選配但很加分）
+## 5) 你最該盯緊的 5 個「實作成敗點」
 
-如果你要把 vMF 集中度（(\kappa)）當作分析指標：
-對每類取其 embedding 平均向量長度 (\bar R)，再用近似反解 (\kappa)（Sra 的近似 / 後續迭代都可）。 ([維基百科][5])
-
-> 這不一定要進訓練圖（只做 eval/analysis），但能讓你「同類塌縮 ⇔ (\kappa) 爆大」的敘事很完整。
-
----
-
-### 最後：3 個 sanity check（跑 200 step 就該看得出來）
-
-1. **加 CARROT 後**：train acc 可能略降，但 `frac_pos_above_U` 會快速下降到很低
-2. `U` 不該經常貼著 0.999（貼太久＝你 corridor 太寬、約束沒作用）
-3. `alpha` 不該爆炸到 1e6（爆炸＝reg 梯度接近 0，通常是 pos_sims 幾乎都在 corridor 內 → 可能 q 設太寬或 batch 太難形成 pos）
+1. **一定要 PK/MPerClassSampler**：每類至少 K≥2（建議 K=4）([Kevin Musgrave][1])
+2. **先把 embedding normalize** 再算半徑/距離（不然尺度漂移很嚴重）
+3. **`detach_stats=True`**：訓練穩定度會差很多（特別是前幾個 epoch）
+4. **C 太小就跳過 CARROT**：batch 裡若只有 1 類（理論上 PK 不會，但保險）就直接回傳原 z
+5. **DDP 要考慮 all_gather 統計**（看你跑起來穩不穩，穩就不用）
 
 ---
 
-如果你把你現在的 baseline（CE / SupCon / ArcFace 其一）訓練碼貼一小段（model forward / loss 計算那段就好），我可以直接幫你把 CARROT 以**最少改動**方式嵌進去，連同 DDP/AMP 的注意事項一起改到能跑。
+如果你願意，我也可以直接把上面整理成一個 **可直接丟進你 trainer 的 `CarrotModule(nn.Module)`**（含 logging：平均 (\gamma)、超過 1 的比例、(r/m) 分佈），再附一個最小可跑的 training step 模板（AMP + grad accumulation + DDP 版本）。
 
-[1]: https://proceedings.neurips.cc/paper/2020/file/d89a66c7c80a29b1bdbab0f2a1a94af8-Paper.pdf?utm_source=chatgpt.com "Supervised Contrastive Learning"
-[2]: https://openaccess.thecvf.com/content_CVPR_2019/papers/Deng_ArcFace_Additive_Angular_Margin_Loss_for_Deep_Face_Recognition_CVPR_2019_paper.pdf?utm_source=chatgpt.com "ArcFace: Additive Angular Margin Loss for Deep Face ..."
-[3]: https://proceedings.mlr.press/v70/guo17a/guo17a.pdf?utm_source=chatgpt.com "On Calibration of Modern Neural Networks"
-[4]: https://lightning.ai/docs/torchmetrics/stable//classification/calibration_error.html?utm_source=chatgpt.com "Calibration Error — PyTorch-Metrics 1.8.2 documentation"
-[5]: https://en.wikipedia.org/wiki/Von_Mises%E2%80%93Fisher_distribution?utm_source=chatgpt.com "Von Mises–Fisher distribution"
+[1]: https://kevinmusgrave.github.io/pytorch-metric-learning/samplers/ "Samplers - PyTorch Metric Learning"
+[2]: https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html "Getting Started with Distributed Data Parallel — PyTorch Tutorials 2.9.0+cu128 documentation"

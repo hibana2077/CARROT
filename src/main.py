@@ -48,10 +48,11 @@ class EpochStats:
     concentration: Optional[float] = None
     carrot_L: Optional[float] = None
     carrot_U: Optional[float] = None
-    carrot_pos_mean: Optional[float] = None
-    carrot_pos_max: Optional[float] = None
-    carrot_frac_pos_above_U: Optional[float] = None
-    carrot_frac_pos_below_L: Optional[float] = None
+    carrot_gamma_mean: Optional[float] = None
+    carrot_gamma_max: Optional[float] = None
+    carrot_frac_gamma_gt_1: Optional[float] = None
+    carrot_r_mean: Optional[float] = None
+    carrot_m_mean: Optional[float] = None
     carrot_alpha: Optional[float] = None
     carrot_reg: Optional[float] = None
 
@@ -79,12 +80,11 @@ def train_one_epoch(
     carrot_reg_sum = 0.0
     carrot_reg_batches = 0
     carrot_sum: Dict[str, float] = {
-        "L": 0.0,
-        "U": 0.0,
-        "pos_mean": 0.0,
-        "pos_max": 0.0,
-        "frac_pos_above_U": 0.0,
-        "frac_pos_below_L": 0.0,
+        "gamma_mean": 0.0,
+        "gamma_max": 0.0,
+        "frac_gamma_gt_1": 0.0,
+        "r_mean": 0.0,
+        "m_mean": 0.0,
         "alpha": 0.0,
     }
 
@@ -97,20 +97,28 @@ def train_one_epoch(
         loss_base = criterion(logits, targets)
 
         if carrot is not None:
-            reg, stats = carrot(z, targets)
+            # CARROT operator (imp.md): expand within-class clouds using in-batch geometry.
+            z_plus, stats = carrot(z, targets)
+            logits_plus = model.head(z_plus)
+
+            # Logit consistency regularization (imp.md): KL( p(z) || p(z_plus) )
+            T = 1.0
+            log_p = F.log_softmax(logits / T, dim=1)
+            q = F.softmax(logits_plus / T, dim=1)
+            reg = F.kl_div(log_p, q, reduction="batchmean") * (T * T)
+
             loss, alpha = grad_balanced_total_loss(loss_base, reg, z)
 
             carrot_reg_sum += float(reg.detach().item())
             carrot_reg_batches += 1
 
-            if stats.L is not None and stats.U is not None:
+            if stats.classes_in_batch >= 2 and stats.gamma_mean is not None:
                 carrot_batches += 1
-                carrot_sum["L"] += float(stats.L)
-                carrot_sum["U"] += float(stats.U)
-                carrot_sum["pos_mean"] += float(stats.pos_mean or 0.0)
-                carrot_sum["pos_max"] += float(stats.pos_max or 0.0)
-                carrot_sum["frac_pos_above_U"] += float(stats.frac_pos_above_U or 0.0)
-                carrot_sum["frac_pos_below_L"] += float(stats.frac_pos_below_L or 0.0)
+                carrot_sum["gamma_mean"] += float(stats.gamma_mean or 0.0)
+                carrot_sum["gamma_max"] += float(stats.gamma_max or 0.0)
+                carrot_sum["frac_gamma_gt_1"] += float(stats.frac_gamma_gt_1 or 0.0)
+                carrot_sum["r_mean"] += float(stats.r_mean or 0.0)
+                carrot_sum["m_mean"] += float(stats.m_mean or 0.0)
                 carrot_sum["alpha"] += float(alpha.item())
         else:
             loss = loss_base
@@ -130,12 +138,11 @@ def train_one_epoch(
     out = EpochStats(loss=avg_loss, acc=avg_acc)
     if carrot is not None and carrot_batches > 0:
         denom = float(carrot_batches)
-        out.carrot_L = carrot_sum["L"] / denom
-        out.carrot_U = carrot_sum["U"] / denom
-        out.carrot_pos_mean = carrot_sum["pos_mean"] / denom
-        out.carrot_pos_max = carrot_sum["pos_max"] / denom
-        out.carrot_frac_pos_above_U = carrot_sum["frac_pos_above_U"] / denom
-        out.carrot_frac_pos_below_L = carrot_sum["frac_pos_below_L"] / denom
+        out.carrot_gamma_mean = carrot_sum["gamma_mean"] / denom
+        out.carrot_gamma_max = carrot_sum["gamma_max"] / denom
+        out.carrot_frac_gamma_gt_1 = carrot_sum["frac_gamma_gt_1"] / denom
+        out.carrot_r_mean = carrot_sum["r_mean"] / denom
+        out.carrot_m_mean = carrot_sum["m_mean"] / denom
         out.carrot_alpha = carrot_sum["alpha"] / denom
     if carrot is not None and carrot_reg_batches > 0:
         out.carrot_reg = carrot_reg_sum / float(carrot_reg_batches)
@@ -371,8 +378,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_download", action="store_true")
 
     p.add_argument("--carrot", action="store_true", help="Enable CARROT regularizer")
+    # Old CARROT args kept for CLI compatibility (no longer used by operator-based CARROT).
     p.add_argument("--carrot_q_hi", type=float, default=0.90)
     p.add_argument("--carrot_q_lo", type=float, default=0.10)
+    p.add_argument("--carrot_k", type=int, default=4, help="Images per class (K) for PK batches")
 
     return p.parse_args()
 
@@ -413,14 +422,43 @@ def main() -> None:
     )
 
     pin_memory = device.type == "cuda"
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,
-    )
+    if args.carrot:
+        # CARROT needs PK batches to estimate per-class stats reliably (imp.md §0).
+        if args.batch_size % int(args.carrot_k) != 0:
+            raise ValueError(
+                f"--batch_size must be a multiple of --carrot_k for PK sampling. "
+                f"Got batch_size={args.batch_size}, carrot_k={args.carrot_k}."
+            )
+        try:
+            from pytorch_metric_learning import samplers  # type: ignore
+
+            train_labels = train_ds.get_all_labels().tolist()
+            sampler = samplers.MPerClassSampler(
+                train_labels, m=int(args.carrot_k), batch_size=int(args.batch_size)
+            )
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=args.batch_size,
+                sampler=sampler,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+                drop_last=True,
+            )
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "CARROT requires pytorch-metric-learning for PK sampling. "
+                "Please install it (see requirements.txt)."
+            ) from e
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            drop_last=False,
+        )
     eval_loader = DataLoader(
         eval_ds,
         batch_size=args.batch_size,
@@ -434,7 +472,7 @@ def main() -> None:
 
     carrot = None
     if args.carrot:
-        carrot = CARROT(q_hi=args.carrot_q_hi, q_lo=args.carrot_q_lo).to(device)
+        carrot = CARROT().to(device)
     if args.optimizer == "sgd":
         optimizer = torch.optim.SGD(
             model.parameters(),
@@ -478,12 +516,11 @@ def main() -> None:
         # imp.md §6 required CARROT logging metrics; append after existing metrics.
         if args.carrot:
             msg += (
-                f" - train_carrot_L {float(train_stats.carrot_L or 0.0):.4f}"
-                f" - train_carrot_U {float(train_stats.carrot_U or 0.0):.4f}"
-                f" - train_carrot_pos_mean {float(train_stats.carrot_pos_mean or 0.0):.4f}"
-                f" - train_carrot_pos_max {float(train_stats.carrot_pos_max or 0.0):.4f}"
-                f" - train_carrot_frac_pos_above_U {float(train_stats.carrot_frac_pos_above_U or 0.0):.4f}"
-                f" - train_carrot_frac_pos_below_L {float(train_stats.carrot_frac_pos_below_L or 0.0):.4f}"
+                f" - train_carrot_gamma_mean {float(train_stats.carrot_gamma_mean or 0.0):.4f}"
+                f" - train_carrot_gamma_max {float(train_stats.carrot_gamma_max or 0.0):.4f}"
+                f" - train_carrot_frac_gamma_gt_1 {float(train_stats.carrot_frac_gamma_gt_1 or 0.0):.4f}"
+                f" - train_carrot_r_mean {float(train_stats.carrot_r_mean or 0.0):.4f}"
+                f" - train_carrot_m_mean {float(train_stats.carrot_m_mean or 0.0):.4f}"
                 f" - train_carrot_alpha {float(train_stats.carrot_alpha or 0.0):.4f}"
                 f" - train_carrot_reg {float(train_stats.carrot_reg or 0.0):.6f}"
             )

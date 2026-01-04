@@ -5,6 +5,9 @@ torchmetrics
 einops
 timm
 
+# CARROT PK sampling
+pytorch-metric-learning
+
 # Data Processing
 numpy
 pandas
