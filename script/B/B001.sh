@@ -23,5 +23,5 @@ python3 -u src/main.py \
   --img_size 224 \
   --optimizer adamw \
   --lr 0.0005 \
-  --graph dsot \
+  --graph dsot --dsot_cost_normalize \
   --seed 42 >> B001.log 2>&1
