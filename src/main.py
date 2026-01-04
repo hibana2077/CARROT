@@ -37,6 +37,8 @@ class EpochStats:
     acc: float
     nll: Optional[float] = None
     ece: Optional[float] = None
+    intra_sim: Optional[float] = None
+    concentration: Optional[float] = None
 
 
 def _top1_correct(logits: torch.Tensor, targets: torch.Tensor) -> int:
@@ -111,6 +113,48 @@ def _ece_from_logits(logits: torch.Tensor, targets: torch.Tensor, n_bins: int = 
     return ece
 
 
+def compute_concentration_metrics(features: torch.Tensor, targets: torch.Tensor) -> Tuple[float, float]:
+    """
+    Compute intra-class similarity and estimated concentration (kappa).
+    features: (N, D)
+    targets: (N,)
+    """
+    # Normalize features to unit sphere for cosine similarity and vMF estimation
+    features = F.normalize(features, p=2, dim=1)
+    
+    unique_classes = torch.unique(targets)
+    
+    intra_sims = []
+    concentrations = []
+    
+    for c in unique_classes:
+        mask = (targets == c)
+        feats_c = features[mask]
+        if feats_c.size(0) < 2:
+            continue
+            
+        # Mean resultant vector
+        R = feats_c.mean(dim=0)
+        R_norm = R.norm().item()
+        
+        # Intra-class similarity (mean cosine similarity to mean direction)
+        intra_sims.append(R_norm)
+        
+        # Concentration estimation (approximate kappa for vMF)
+        # kappa approx (R * D - R^3) / (1 - R^2)
+        D = feats_c.size(1)
+        if R_norm >= 0.999:
+            kappa = 100.0 # Cap it to avoid overflow
+        else:
+            kappa = (R_norm * D - R_norm**3) / (1 - R_norm**2)
+        concentrations.append(kappa)
+        
+    if not intra_sims:
+        return 0.0, 0.0
+        
+    return float(np.mean(intra_sims)), float(np.mean(concentrations))
+
+
 @torch.no_grad()
 def evaluate(
     model: FGModel,
@@ -126,11 +170,14 @@ def evaluate(
     total_nll = 0.0
     total_ece_weighted = 0.0
 
+    all_features = []
+    all_targets = []
+
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        logits, _ = model(images)
+        logits, z = model(images)
         loss = criterion(logits, targets)
         nll_sum = float(F.cross_entropy(logits, targets, reduction="sum").item())
         ece = float(_ece_from_logits(logits, targets).item())
@@ -142,11 +189,23 @@ def evaluate(
         total_nll += nll_sum
         total_ece_weighted += ece * batch_size
 
+        all_features.append(z.cpu())
+        all_targets.append(targets.cpu())
+
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
     avg_nll = total_nll / max(1, total_samples)
     avg_ece = total_ece_weighted / max(1, total_samples)
-    return EpochStats(loss=avg_loss, acc=avg_acc, nll=avg_nll, ece=avg_ece)
+
+    # Compute concentration metrics
+    if all_features:
+        all_features = torch.cat(all_features, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        intra_sim, concentration = compute_concentration_metrics(all_features, all_targets)
+    else:
+        intra_sim, concentration = 0.0, 0.0
+
+    return EpochStats(loss=avg_loss, acc=avg_acc, nll=avg_nll, ece=avg_ece, intra_sim=intra_sim, concentration=concentration)
 
 
 def build_transforms(model: nn.Module, img_size: int):
@@ -341,7 +400,9 @@ def main() -> None:
             f"Epoch {epoch} - train_acc {train_stats.acc:.4f} - "
             f"test_acc {eval_stats.acc:.4f} - "
             f"test_nll {float(eval_stats.nll):.4f} - "
-            f"test_ece {float(eval_stats.ece):.4f}"
+            f"test_ece {float(eval_stats.ece):.4f} - "
+            f"test_intra_sim {float(eval_stats.intra_sim):.4f} - "
+            f"test_concentration {float(eval_stats.concentration):.4f}"
         )
 
         msg += f" - {elapsed:.1f} seconds"
@@ -352,15 +413,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main)
-        eval_stats = evaluate(model, eval_loader, device, criterion)
-        scheduler.step()
-        elapsed = time.time() - t0
-
-        # Required format (no tqdm; accuracy is epoch-average)
-        msg = (
-            f"Epoch {epoch} - train_acc {train_stats.acc:.4f} - "
-            f"test_acc {eval_stats.acc:.4f} - "
-            f"test_nll {float(eval_stats.nll):.4f} - "
-            f"test_ece {float(eval_stats.ece):.4f}"
-        )
+    main()
