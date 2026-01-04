@@ -14,6 +14,7 @@ try:
     # When running as a script: `python src/main.py`
     from dataset.ufgvc import UFGVCDataset
     from models.timm_fg import TimmFGModel
+    from models.graph_model import GraphModelConfig, TimmDSOTGraphModel
     from profiling.flops import compute_flops_params_ptflops
     from profiling.latency import measure_latency_ms_per_image
     from train_eval import evaluate, train_one_epoch
@@ -21,6 +22,7 @@ except ModuleNotFoundError:
     # When running as a module: `python -m src.main`
     from .dataset.ufgvc import UFGVCDataset
     from .models.timm_fg import TimmFGModel
+    from .models.graph_model import GraphModelConfig, TimmDSOTGraphModel
     from .profiling.flops import compute_flops_params_ptflops
     from .profiling.latency import measure_latency_ms_per_image
     from .train_eval import evaluate, train_one_epoch
@@ -89,6 +91,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", type=str, default="vit_base_patch16_224")
     p.add_argument("--pretrained", action="store_true")
 
+    p.add_argument("--graph", type=str, default="none", choices=["none", "dsot"], help="graph head mode")
+
+    # DSOT graph builder hyper-params
+    p.add_argument("--dsot_k", type=int, default=16)
+    p.add_argument("--dsot_eps", type=float, default=0.10)
+    p.add_argument("--dsot_sinkhorn_iters", type=int, default=20)
+    p.add_argument("--dsot_lambda_pos", type=float, default=0.10)
+    p.add_argument("--dsot_self_loop_alpha", type=float, default=0.20)
+    p.add_argument("--dsot_cost_normalize", action="store_true", help="normalize cost scale before Sinkhorn")
+
+    # GNN head hyper-params
+    p.add_argument("--gnn_hidden_dim", type=int, default=256)
+    p.add_argument("--gnn_layers", type=int, default=2)
+    p.add_argument("--gnn_dropout", type=float, default=0.0)
+
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--optimizer", type=str, default="sgd", choices=["sgd", "adamw"])
     p.add_argument("--lr", type=float, default=0.03)
@@ -122,15 +139,36 @@ def main() -> None:
     )
 
     num_classes = len(train_ds.classes)
-    model = TimmFGModel(
-        backbone_name=args.model,
-        num_classes=num_classes,
-        pretrained=bool(args.pretrained),
-    )
+    if str(args.graph).lower() == "dsot":
+        cfg = GraphModelConfig(
+            dsot_k=int(args.dsot_k),
+            dsot_eps=float(args.dsot_eps),
+            dsot_sinkhorn_iters=int(args.dsot_sinkhorn_iters),
+            dsot_lambda_pos=float(args.dsot_lambda_pos),
+            dsot_self_loop_alpha=float(args.dsot_self_loop_alpha),
+            dsot_cost_normalize=bool(args.dsot_cost_normalize),
+            gnn_hidden_dim=int(args.gnn_hidden_dim),
+            gnn_layers=int(args.gnn_layers),
+            gnn_dropout=float(args.gnn_dropout),
+        )
+        model = TimmDSOTGraphModel(
+            backbone_name=args.model,
+            num_classes=num_classes,
+            pretrained=bool(args.pretrained),
+            cfg=cfg,
+        )
+    else:
+        model = TimmFGModel(
+            backbone_name=args.model,
+            num_classes=num_classes,
+            pretrained=bool(args.pretrained),
+        )
     model.to(device)
 
     # Rebuild transforms with actual model (timm can resolve better defaults)
-    train_tf, eval_tf = build_transforms(model.backbone, img_size=int(args.img_size))
+    # Rebuild transforms with actual backbone (timm can resolve better defaults)
+    backbone_for_tf = getattr(model, "backbone", model)
+    train_tf, eval_tf = build_transforms(backbone_for_tf, img_size=int(args.img_size))
     train_ds.transform = train_tf
 
     eval_ds, _eval_split = build_eval_dataset(
@@ -162,7 +200,8 @@ def main() -> None:
     criterion = nn.CrossEntropyLoss()
 
     # Inference profiling (best-effort): FLOPs (ptflops) + latency (ms/image)
-    flops_res = compute_flops_params_ptflops(model.backbone, img_size=int(args.img_size), device=device)
+    # FLOPs are computed on the backbone (graph head FLOPs are not included here)
+    flops_res = compute_flops_params_ptflops(backbone_for_tf, img_size=int(args.img_size), device=device)
     flops_g = (flops_res.flops / 1e9) if (flops_res.flops is not None) else None
 
     latency_ms_img = None
