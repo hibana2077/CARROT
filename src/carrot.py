@@ -120,11 +120,6 @@ def carrot_operator(
     return z_plus, stats
 
 
-# Disable TorchDynamo compilation for this operator.
-if _torch_dynamo is not None:
-    carrot_operator = _torch_dynamo.disable(carrot_operator)
-
-
 class CARROT(nn.Module):
     """CARROT operator module.
 
