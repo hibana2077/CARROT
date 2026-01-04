@@ -14,6 +14,13 @@ import timm
 
 try:
     # When running as a script: `python src/main.py`
+    from carrot import CARROT, grad_balanced_total_loss  # type: ignore[import-not-found]
+except ModuleNotFoundError:
+    # When running as a module: `python -m src.main`
+    from .carrot import CARROT, grad_balanced_total_loss
+
+try:
+    # When running as a script: `python src/main.py`
     from dataset.ufgvc import UFGVCDataset
     from models import FGModel  # type: ignore[import-not-found]
 except ModuleNotFoundError:
@@ -39,6 +46,14 @@ class EpochStats:
     ece: Optional[float] = None
     intra_sim: Optional[float] = None
     concentration: Optional[float] = None
+    carrot_L: Optional[float] = None
+    carrot_U: Optional[float] = None
+    carrot_pos_mean: Optional[float] = None
+    carrot_pos_max: Optional[float] = None
+    carrot_frac_pos_above_U: Optional[float] = None
+    carrot_frac_pos_below_L: Optional[float] = None
+    carrot_alpha: Optional[float] = None
+    carrot_reg: Optional[float] = None
 
 
 def _top1_correct(logits: torch.Tensor, targets: torch.Tensor) -> int:
@@ -52,6 +67,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     criterion: nn.Module,
+    carrot: Optional[CARROT] = None,
 ) -> EpochStats:
     model.train()
 
@@ -59,13 +75,45 @@ def train_one_epoch(
     total_loss = 0.0
     total_correct = 0
 
+    carrot_batches = 0
+    carrot_reg_sum = 0.0
+    carrot_reg_batches = 0
+    carrot_sum: Dict[str, float] = {
+        "L": 0.0,
+        "U": 0.0,
+        "pos_mean": 0.0,
+        "pos_max": 0.0,
+        "frac_pos_above_U": 0.0,
+        "frac_pos_below_L": 0.0,
+        "alpha": 0.0,
+    }
+
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         logits, z = model(images)
-        loss = criterion(logits, targets)
+        loss_base = criterion(logits, targets)
+
+        if carrot is not None:
+            reg, stats = carrot(z, targets)
+            loss, alpha = grad_balanced_total_loss(loss_base, reg, z)
+
+            carrot_reg_sum += float(reg.detach().item())
+            carrot_reg_batches += 1
+
+            if stats.L is not None and stats.U is not None:
+                carrot_batches += 1
+                carrot_sum["L"] += float(stats.L)
+                carrot_sum["U"] += float(stats.U)
+                carrot_sum["pos_mean"] += float(stats.pos_mean or 0.0)
+                carrot_sum["pos_max"] += float(stats.pos_max or 0.0)
+                carrot_sum["frac_pos_above_U"] += float(stats.frac_pos_above_U or 0.0)
+                carrot_sum["frac_pos_below_L"] += float(stats.frac_pos_below_L or 0.0)
+                carrot_sum["alpha"] += float(alpha.item())
+        else:
+            loss = loss_base
 
         batch_size = targets.size(0)
 
@@ -79,7 +127,19 @@ def train_one_epoch(
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
 
-    return EpochStats(loss=avg_loss, acc=avg_acc)
+    out = EpochStats(loss=avg_loss, acc=avg_acc)
+    if carrot is not None and carrot_batches > 0:
+        denom = float(carrot_batches)
+        out.carrot_L = carrot_sum["L"] / denom
+        out.carrot_U = carrot_sum["U"] / denom
+        out.carrot_pos_mean = carrot_sum["pos_mean"] / denom
+        out.carrot_pos_max = carrot_sum["pos_max"] / denom
+        out.carrot_frac_pos_above_U = carrot_sum["frac_pos_above_U"] / denom
+        out.carrot_frac_pos_below_L = carrot_sum["frac_pos_below_L"] / denom
+        out.carrot_alpha = carrot_sum["alpha"] / denom
+    if carrot is not None and carrot_reg_batches > 0:
+        out.carrot_reg = carrot_reg_sum / float(carrot_reg_batches)
+    return out
 
 @torch.no_grad()
 def _ece_from_logits(logits: torch.Tensor, targets: torch.Tensor, n_bins: int = 15) -> torch.Tensor:
@@ -310,6 +370,10 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--no_download", action="store_true")
 
+    p.add_argument("--carrot", action="store_true", help="Enable CARROT regularizer")
+    p.add_argument("--carrot_q_hi", type=float, default=0.90)
+    p.add_argument("--carrot_q_lo", type=float, default=0.10)
+
     return p.parse_args()
 
 
@@ -367,6 +431,10 @@ def main() -> None:
     )
 
     criterion = nn.CrossEntropyLoss()
+
+    carrot = None
+    if args.carrot:
+        carrot = CARROT(q_hi=args.carrot_q_hi, q_lo=args.carrot_q_lo).to(device)
     if args.optimizer == "sgd":
         optimizer = torch.optim.SGD(
             model.parameters(),
@@ -391,6 +459,7 @@ def main() -> None:
             optimizer,
             device,
             criterion,
+            carrot=carrot,
         )
         eval_stats = evaluate(model, eval_loader, device, criterion)
         scheduler.step()
@@ -405,6 +474,19 @@ def main() -> None:
             f"test_intra_sim {float(eval_stats.intra_sim):.4f} - "
             f"test_concentration {float(eval_stats.concentration):.4f}"
         )
+
+        # imp.md §6 required CARROT logging metrics; append after existing metrics.
+        if args.carrot:
+            msg += (
+                f" - train_carrot_L {float(train_stats.carrot_L or 0.0):.4f}"
+                f" - train_carrot_U {float(train_stats.carrot_U or 0.0):.4f}"
+                f" - train_carrot_pos_mean {float(train_stats.carrot_pos_mean or 0.0):.4f}"
+                f" - train_carrot_pos_max {float(train_stats.carrot_pos_max or 0.0):.4f}"
+                f" - train_carrot_frac_pos_above_U {float(train_stats.carrot_frac_pos_above_U or 0.0):.4f}"
+                f" - train_carrot_frac_pos_below_L {float(train_stats.carrot_frac_pos_below_L or 0.0):.4f}"
+                f" - train_carrot_alpha {float(train_stats.carrot_alpha or 0.0):.4f}"
+                f" - train_carrot_reg {float(train_stats.carrot_reg or 0.0):.6f}"
+            )
 
         msg += f" - {elapsed:.1f} seconds"
         print(msg, flush=True)
