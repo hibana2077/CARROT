@@ -78,6 +78,7 @@ def carrot_operator(
 
     # torch.cdist can be a hotspot; prefer the MM-based euclidean path when available.
     try:
+        print("Using MM-based euclidean distance for cdist")
         dist_cc = torch.cdist(
             mu,
             mu,
@@ -85,6 +86,7 @@ def carrot_operator(
             compute_mode="use_mm_for_euclid_dist_if_necessary",
         )  # (C, C)
     except TypeError:
+        print("Using default cdist for euclidean distance")
         dist_cc = torch.cdist(mu, mu, p=2)  # (C, C)
     dist_cc.fill_diagonal_(float("inf"))
     m = dist_cc.min(dim=1).values  # (C,)
@@ -97,17 +99,11 @@ def carrot_operator(
 
     z_plus = mu[inv] + gamma[inv].unsqueeze(1) * (z - mu[inv])
 
-    # gamma_mean = float(gamma.mean().item())
-    # gamma_max = float(gamma.max().item())
-    # frac_gamma_gt_1 = float((gamma > 1.0 + 1e-12).float().mean().item())
-    # r_mean = float(r.mean().item())
-    # m_mean = float(m.mean().item())
-    # Temp: avoid logging stats to reduce overhead.
-    gamma_mean = 1.0
-    gamma_max = 1.0
-    frac_gamma_gt_1 = 0.0
-    r_mean = 0.0
-    m_mean = 0.0
+    gamma_mean = float(gamma.mean().item())
+    gamma_max = float(gamma.max().item())
+    frac_gamma_gt_1 = float((gamma > 1.0 + 1e-12).float().mean().item())
+    r_mean = float(r.mean().item())
+    m_mean = float(m.mean().item())
 
     stats = CarrotStats(
         classes_in_batch=C,
