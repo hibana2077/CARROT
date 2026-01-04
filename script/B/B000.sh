@@ -17,10 +17,10 @@ export HF_HUB_OFFLINE=1
 cd ../..
 python3 -u src/main.py \
   --dataset cub_200_2011 --data_root ./data \
-  --model resnet50.a1_in1k --pretrained \
+  --model vit_base_patch16_224 --pretrained \
   --epochs 1000 \
-  --batch_size 64 --num_workers 0 \
-  --img_size 256 \
+  --batch_size 256 --num_workers 0 \
+  --img_size 224 \
   --optimizer adamw \
   --lr 0.0005 \
   --seed 42 >> B000.log 2>&1
