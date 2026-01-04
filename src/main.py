@@ -16,10 +16,12 @@ try:
     # When running as a script: `python src/main.py`
     from dataset.ufgvc import UFGVCDataset
     from models import FGModel  # type: ignore[import-not-found]
+    from carrot import carrot_regularizer
 except ModuleNotFoundError:
     # When running as a module: `python -m src.main`
     from .dataset.ufgvc import UFGVCDataset
     from .models import FGModel  # type: ignore[import-not-found]
+    from .carrot import carrot_regularizer
 
 
 def set_seed(seed: int) -> None:
@@ -50,6 +52,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     criterion: nn.Module,
+    use_carrot: bool = False,
 ) -> EpochStats:
     model.train()
 
@@ -62,8 +65,12 @@ def train_one_epoch(
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(images)
+        logits, z = model(images)
         loss = criterion(logits, targets)
+
+        if use_carrot:
+            reg, _stats = carrot_regularizer(z, targets)
+            loss = loss + reg
 
         loss.backward()
         optimizer.step()
@@ -129,7 +136,7 @@ def evaluate(
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        logits = model(images)
+        logits, _ = model(images)
         loss = criterion(logits, targets)
         nll_sum = float(F.cross_entropy(logits, targets, reduction="sum").item())
         ece = float(_ece_from_logits(logits, targets).item())
@@ -238,15 +245,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", type=str, default="vit_base_patch16_224")
     p.add_argument("--pretrained", action="store_true")
 
-    # Head
-    p.add_argument(
-        "--head",
-        type=str,
-        default="zzz",
-        choices=["zzz", "linear"],
-        help="Classifier head type (default: zzz)",
-    )
-    p.add_argument("--zzz_rank", type=int, default=8, help="ZZZ head low-rank dimension")
+    # CARROT
+    p.add_argument("--use_carrot", action="store_true", help="Enable CARROT regularization")
 
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--optimizer", type=str, default="sgd", choices=["sgd", "adamw"])
@@ -285,8 +285,6 @@ def main() -> None:
     model = FGModel(
         backbone_name=args.model,
         num_classes=num_classes,
-        head_type=args.head,
-        zzz_rank=int(args.zzz_rank),
         pretrained=args.pretrained,
     )
     model.to(device)
@@ -345,6 +343,7 @@ def main() -> None:
             optimizer,
             device,
             criterion,
+            use_carrot=args.use_carrot,
         )
         eval_stats = evaluate(model, eval_loader, device, criterion)
         scheduler.step()

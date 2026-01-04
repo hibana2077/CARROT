@@ -1,211 +1,221 @@
-下面給你一份「**ZZZ 分類頭（plug-and-play）+ timm backbone**」的核心實作引導，重點放在：**怎麼從 timm 拿到向量特徵**、**ZZZ head 的 forward（Woodbury + determinant lemma 的封閉形式）**、以及**正交子空間 (U_c) 的可微分維持方式（QR retraction）**。
+下面給你一個「**CARROT 核心正則化**」的**可直接套進 timm backbone** 的實作骨架（PyTorch）。重點是：用 `timm.create_model(..., num_classes=0)` 直接把 backbone 變成**輸出 pooled embedding**（B, D），再接一個自己的線性分類頭；CARROT 正則化就吃 embedding + label。這個用法是 timm 官方文件推薦的 feature extraction 方式之一。 ([Hugging Face][1])
+
+同時也附上 timm 的 `resolve_data_config` + `create_transform` 取得對應 backbone 的預處理。 ([Hugging Face][2])
 
 ---
 
-## 1) 用 timm 做 backbone：拿到 pooled embedding（向量）
-
-最穩的做法是把 `num_classes=0`，讓 timm 直接回傳「分類器前的 embedding」，跨 convnet / ViT 都好用。 ([GitHub][1])
+## 1) Model：timm backbone（輸出 embedding）+ linear head
 
 ```python
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
 
-def build_backbone(model_name: str = "vit_base_patch16_224", pretrained: bool = True):
-    backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
-    feat_dim = backbone.num_features
-    return backbone, feat_dim
+class CarrotClassifier(nn.Module):
+    """
+    backbone: timm model with num_classes=0 -> outputs pooled features [B, D]
+    head: linear classifier
+    """
+    def __init__(self, backbone_name: str, num_classes: int, pretrained: bool = True):
+        super().__init__()
+        # timm: create model with no classifier -> calling model(x) returns pooled features
+        # 官方示例：num_classes=0 會回傳 pooled feature 向量 :contentReference[oaicite:2]{index=2}
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=0,      # IMPORTANT: remove classifier
+        )
+        feat_dim = self.backbone.num_features  # timm common API :contentReference[oaicite:3]{index=3}
+        self.head = nn.Linear(feat_dim, num_classes)
+
+    def forward(self, x: torch.Tensor):
+        z = self.backbone(x)          # [B, D]
+        logits = self.head(z)         # [B, C]
+        return logits, z
 ```
 
-> 如果你改天想拿多尺度 feature maps（FPN-like）而不是向量，用 `features_only=True`。 ([Peijie Dong][2])
+> 補充：你也可以用 `forward_features()` 做 feature extraction，但對某些 convnet 會回傳未 pooled 的 feature map；`num_classes=0` 這種寫法通常更「一致」地拿到 pooled embedding。 ([Hugging Face][3])
 
 ---
 
-## 2) ZZZ Head：參數化與核心 logits（封閉形式，O(B·C·r)）
+## 2) CARROT 核心：Variance Barrier + Effective-Rank Barrier
 
-### 2.1 參數設計（每類一個「均值 + 子空間 + 方向性變異」）
+這裡的 CARROT 正則化完全是 **plug-and-play**：只用 batch 內的 `(embedding z, label y)` 做統計量，回傳兩個 barrier 的 loss。
 
-* (\mu_c \in \mathbb{R}^d)：類別中心（forward 時 normalize）
-* (A_c \in \mathbb{R}^{d\times r})：未約束矩陣，forward 時做 QR 得到正交基 (U_c)
-* (v_c \in \mathbb{R}_+^r)：子空間方向上的變異尺度（用 softplus 保證正）
-* (\sigma^2>0)：全域 isotropic 噪聲（同樣用 softplus）
-* bias (b_c)
+* **Variance barrier**：類內 trace 太小就用 `-log(r_c)` 爆炸式阻止塌縮
+* **Rank barrier**：用 covariance 的 eigen-spectrum entropy 做 effective rank，再 `-log(erank/d)` 防止只剩低維
 
-### 2.2 用 Woodbury + determinant lemma 做「不用反矩陣」的 Mahalanobis 與 logdet
-
-對每類：
-[
-\Sigma_c = U_c \mathrm{diag}(v_c)U_c^\top + \sigma^2 I
-]
-[
-s_c(x)= -\tfrac12 (x-\mu_c)^\top \Sigma_c^{-1}(x-\mu_c) - \tfrac12\log|\Sigma_c| + b_c
-]
-
-* 逆矩陣用 Woodbury identity： ([維基百科][3])
-* 行列式用 matrix determinant lemma（低秩更新）： ([維基百科][4])
-* 正交基用 `torch.linalg.qr`（可批次 QR）： ([PyTorch 文檔][5])
-
----
-
-## 3) 核心實作：ZZZHead（PyTorch）
+> 計算 spectrum 我用 `torch.linalg.svdvals`（對矩陣取 singular values），PyTorch 官方 API。 ([PyTorch Docs][4])
 
 ```python
 import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from typing import Dict, Tuple
 
-class ZZZHead(nn.Module):
+def _trace_cov_from_centered(xc: torch.Tensor) -> torch.Tensor:
     """
-    ZZZ: Z-Normalized Z-Subspace Zooming head
-    - plug-and-play classifier head for FGVC
-    - low-rank per-class covariance with orthonormal basis via QR
+    xc: [n, d] centered
+    trace(cov) = sum_j Var_j = mean over samples of squared centered coords, summed over dims.
     """
-    def __init__(self, num_classes: int, feat_dim: int, rank: int = 8,
-                 v_min: float = 1e-4, sigma2_min: float = 1e-4):
-        super().__init__()
-        self.C = num_classes
-        self.d = feat_dim
-        self.r = rank
-        self.v_min = v_min
-        self.sigma2_min = sigma2_min
+    n = xc.shape[0]
+    # cov diag = mean(xc^2) ; trace = sum(diag)
+    return (xc.pow(2).sum(dim=1).mean())  # equivalent to mean over samples of ||xc||^2
 
-        # class mean (unnormalized; normalize in forward)
-        self.mu = nn.Parameter(torch.randn(num_classes, feat_dim) * 0.02)
+def _effective_rank_from_centered(xc: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Effective rank based on covariance eigenvalues.
+    For xc [n, d], eigenvalues of cov are (s^2)/n where s are singular values of xc.
+    We compute entropy of normalized eigenvalues -> erank = exp(H).
+    """
+    n, d = xc.shape
+    # SVD on [n, d] (usually n << d), take singular values
+    s = torch.linalg.svdvals(xc)  # [min(n, d)] :contentReference[oaicite:6]{index=6}
+    lam = (s * s) / max(n, 1)     # eigenvalues (up to rank)
+    lam_sum = lam.sum().clamp_min(eps)
+    p = (lam / lam_sum).clamp_min(eps)
+    H = -(p * torch.log(p)).sum()
+    erank = torch.exp(H)
+    return erank  # in [1, min(n,d)]
 
-        # unconstrained basis params, will QR -> U (C,d,r)
-        self.A = nn.Parameter(torch.randn(num_classes, feat_dim, rank) * 0.02)
+def carrot_regularizer(
+    z: torch.Tensor,  # [B, D]
+    y: torch.Tensor,  # [B]
+    eps: float = 1e-12,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Returns:
+      R = R_var + R_rank
+      stats for logging
+    """
+    assert z.dim() == 2 and y.dim() == 1 and z.shape[0] == y.shape[0]
+    B, D = z.shape
 
-        # directional variances (unnormalized)
-        self.v_raw = nn.Parameter(torch.zeros(num_classes, rank))
+    # 建議用 float32 計算統計量，尤其是 SVD（AMP 下避免 half 精度不穩）
+    zf = z.float()
+    yf = y
 
-        # global isotropic variance sigma^2 (raw)
-        self.sigma2_raw = nn.Parameter(torch.tensor(0.0))
+    # batch total scatter (for self-normalization)
+    mu_b = zf.mean(dim=0, keepdim=True)
+    xc_b = zf - mu_b
+    S_bar = _trace_cov_from_centered(xc_b).clamp_min(eps)
 
-        # class bias
-        self.bias = nn.Parameter(torch.zeros(num_classes))
+    classes = torch.unique(yf)
+    r_var_terms = []
+    r_rank_terms = []
 
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        """
-        feats: (B,d) pooled embedding from timm backbone
-        returns logits: (B,C)
-        """
-        B, d = feats.shape
-        assert d == self.d
+    used = 0
+    min_r = float("inf")
+    min_er = float("inf")
 
-        # Z-Normalized features and means
-        x = F.normalize(feats, dim=-1)
-        mu = F.normalize(self.mu, dim=-1)
+    for c in classes:
+        idx = (yf == c).nonzero(as_tuple=True)[0]
+        n = idx.numel()
+        if n < 2:
+            continue  # 沒法估 cov，就跳過（不然會很 noisy）
+        used += 1
 
-        # Orthonormal basis via QR (batch QR over classes)
-        # A: (C,d,r) -> Q: (C,d,r)
-        U, _ = torch.linalg.qr(self.A, mode='reduced')  # Stiefel retraction
+        X = zf.index_select(0, idx)                  # [n, D]
+        mu = X.mean(dim=0, keepdim=True)
+        xc = X - mu                                  # centered
 
-        # Positive variances
-        v = F.softplus(self.v_raw) + self.v_min          # (C,r)
-        sigma2 = F.softplus(self.sigma2_raw) + self.sigma2_min  # scalar
-        alpha = 1.0 / sigma2  # scalar
+        # variance barrier
+        S_c = _trace_cov_from_centered(xc).clamp_min(eps)
+        r_c = (S_c / S_bar).clamp_min(eps)
+        r_var_terms.append(-torch.log(r_c))
 
-        # delta: (B,C,d)
-        delta = x[:, None, :] - mu[None, :, :]
+        # rank barrier
+        erank = _effective_rank_from_centered(xc, eps=eps)   # [1, min(n,D)]
+        er_norm = (erank / D).clamp_min(eps)
+        r_rank_terms.append(-torch.log(er_norm))
 
-        # ||delta||^2 : (B,C)
-        delta2 = (delta * delta).sum(dim=-1)
+        min_r = min(min_r, float(r_c.detach().cpu()))
+        min_er = min(min_er, float(er_norm.detach().cpu()))
 
-        # t = delta^T U : (B,C,r)
-        # einsum: (B,C,d) x (C,d,r) -> (B,C,r)
-        t = torch.einsum('bcd,cdr->bcr', delta, U)
+    if used == 0:
+        R_var = zf.new_tensor(0.0)
+        R_rank = zf.new_tensor(0.0)
+    else:
+        R_var = torch.stack(r_var_terms).mean()
+        R_rank = torch.stack(r_rank_terms).mean()
 
-        # Woodbury simplification (since V is diagonal and A = sigma^2 I):
-        # M = V^{-1} + alpha I  => M^{-1} diagonal: 1 / (1/v + alpha) = v / (1 + alpha v)
-        Minv = v / (1.0 + alpha * v)  # (C,r)
-
-        # Mahalanobis term:
-        # delta^T Σ^{-1} delta = alpha||delta||^2 - alpha^2 * sum_i (t_i^2 * Minv_i)
-        maha = alpha * delta2 - (alpha * alpha) * (t * t * Minv[None, :, :]).sum(dim=-1)  # (B,C)
-
-        # logdet:
-        # |Σ| = (sigma2^d) * Π_i (1 + v_i / sigma2)
-        # log|Σ| = d log(sigma2) + Σ_i log(1 + alpha v_i)
-        logdet = (self.d * torch.log(sigma2)) + torch.log1p(alpha * v).sum(dim=-1)  # (C,)
-
-        # logit = -1/2 (maha + logdet) + bias
-        logits = -0.5 * (maha + logdet[None, :]) + self.bias[None, :]
-        return logits
+    R = R_var + R_rank
+    stats = {
+        "carrot/R": float(R.detach().cpu()),
+        "carrot/R_var": float(R_var.detach().cpu()),
+        "carrot/R_rank": float(R_rank.detach().cpu()),
+        "carrot/used_classes": used,
+        "carrot/min_r": (min_r if used > 0 else float("nan")),
+        "carrot/min_erank_norm": (min_er if used > 0 else float("nan")),
+    }
+    return R, stats
 ```
 
 ---
 
-## 4) 把 timm backbone + ZZZHead 組起來（完整模型）
+## 3) Training step：CE + CARROT（不需要額外超參數）
 
 ```python
-class ZZZModel(nn.Module):
-    def __init__(self, backbone_name: str, num_classes: int, rank: int = 8, pretrained: bool = True):
-        super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
-        feat_dim = self.backbone.num_features
-        self.head = ZZZHead(num_classes=num_classes, feat_dim=feat_dim, rank=rank)
+from torch.cuda.amp import autocast, GradScaler
 
-    def forward(self, x):
-        feats = self.backbone(x)        # (B,d) embedding
-        logits = self.head(feats)       # (B,C)
-        return logits
+def train_one_step(model, optimizer, images, labels, scaler: GradScaler | None = None):
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    use_amp = scaler is not None
+    with autocast(enabled=use_amp):
+        logits, z = model(images)
+        ce = F.cross_entropy(logits, labels)
+
+        # CARROT regularizer (parameter-free)
+        reg, stats = carrot_regularizer(z, labels)
+
+        loss = ce + reg
+
+    if use_amp:
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        optimizer.step()
+
+    stats.update({
+        "loss": float(loss.detach().cpu()),
+        "loss/ce": float(ce.detach().cpu()),
+    })
+    return stats
 ```
 
 ---
 
-## 5) 訓練步驟（核心）
-
-### 5.1 Loss
-
-先用最乾淨的：
-
-* `CrossEntropy(logits, y)`
-  你之後要加 ablation 再加：
-* `shrinkage / v-regularization`（避免 v 無限長大）
-* `mu-U 去耦合正則`（可選）
+## 4) timm 對應的 data transform（建議你直接用 backbone 的 pretrained_cfg）
 
 ```python
-def loss_fn(logits, y):
-    return F.cross_entropy(logits, y)
-```
+from timm.data import resolve_data_config
+from timm.data.transforms_factory import create_transform
 
-### 5.2 Optimizer（建議 head 用較大 LR）
-
-```python
-model = ZZZModel("vit_base_patch16_224", num_classes=200, rank=8, pretrained=True).cuda()
-
-# backbone lr 小，head lr 大
-opt = torch.optim.AdamW([
-    {"params": model.backbone.parameters(), "lr": 1e-5, "weight_decay": 0.05},
-    {"params": model.head.parameters(),     "lr": 5e-4, "weight_decay": 0.01},
-])
-
-for images, labels in train_loader:
-    images, labels = images.cuda(), labels.cuda()
-    opt.zero_grad(set_to_none=True)
-    logits = model(images)
-    loss = loss_fn(logits, labels)
-    loss.backward()
-    opt.step()
+def build_timm_transforms(model: torch.nn.Module, is_training: bool):
+    # timm 官方流程：resolve_data_config + create_transform :contentReference[oaicite:7]{index=7}
+    cfg = resolve_data_config({}, model=model)
+    tfm = create_transform(**cfg, is_training=is_training)
+    return tfm
 ```
 
 ---
 
-## 6) 實作細節與踩雷點（FGVC 常見）
+## 你接下來最常踩的兩個坑（我先幫你避開）
 
-1. **rank r 不要大**：通常 `r=4/8/16` 就很夠（CUB 類別 200，d 常見 768/1024/2048）。
-2. **數值穩定**：`sigma2_min`、`v_min` 先保底；`log1p` 已經對小值友善。
-3. **QR 成本**：`torch.linalg.qr` 可 batch 做，rank 小時很快。 ([PyTorch 文檔][5])
-4. **想拿 unpooled features 再自己 pool**：timm 也支援多種拿 feature 的方式（例如 `forward_features` / `features_only`），但跨模型一致性上，`num_classes=0` 通常最省事。 ([GitHub][1])
+1. **CARROT 的統計量請用 float32 算**
+   AMP 下半精度做 SVD 容易不穩（所以我在 `carrot_regularizer()` 裡把 `z.float()` 了）。
+
+2. **batch 內每類至少要有 2 張**
+   不然 covariance/erank 估計會爆；我已經把 `n < 2` 的 class 跳過了。FGVC 常用 balanced sampler 會更穩（但不改也能跑）。
 
 ---
 
-如果你接下來想把「理論包裝」做得更漂亮，我可以再幫你把 **(1) Woodbury 推導到你這個對角 (V) 的簡化形式**、**(2) logdet 用 determinant lemma 的一步到位**、以及 **(3) r=0 退化回 cosine/linear head 的等價性**整理成 paper 的 Theory 小節（含 lemma/prop 的文字版）。
+如果你想要更「paper 味」：我也可以把這份實作對應回你前面寫的數學式（(r_c, S_c, \bar S, \mathrm{erank})）並整理成演算法框（Algorithm 1），以及給你一個更快的向量化版本（不用 for loop、可在 batch 很大時加速）。
 
-[1]: https://github.com/huggingface/pytorch-image-models/discussions/1154?utm_source=chatgpt.com "Feature Extraction · huggingface pytorch-image-models"
-[2]: https://pprp.github.io/timm/feature_extraction/?utm_source=chatgpt.com "Feature Extraction - Pytorch Image Models"
-[3]: https://en.wikipedia.org/wiki/Woodbury_matrix_identity?utm_source=chatgpt.com "Woodbury matrix identity"
-[4]: https://en.wikipedia.org/wiki/Matrix_determinant_lemma?utm_source=chatgpt.com "Matrix determinant lemma"
-[5]: https://docs.pytorch.org/docs/stable/generated/torch.linalg.qr.html?utm_source=chatgpt.com "torch.linalg.qr"
+[1]: https://huggingface.co/docs/timm/en/feature_extraction?utm_source=chatgpt.com "Feature Extraction"
+[2]: https://huggingface.co/docs/hub/en/timm?utm_source=chatgpt.com "Using timm at Hugging Face"
+[3]: https://huggingface.co/docs/timm/en/quickstart?utm_source=chatgpt.com "Quickstart"
+[4]: https://docs.pytorch.org/docs/stable/generated/torch.linalg.svdvals.html?utm_source=chatgpt.com "torch.linalg.svdvals"

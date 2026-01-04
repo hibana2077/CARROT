@@ -1,41 +1,29 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 import timm
 
-try:
-    # When running as a script: `python src/main.py`
-    from zzz_head import ZZZHead
-except ModuleNotFoundError:
-    # When running as a module: `python -m src.main`
-    from .zzz_head import ZZZHead
-
 
 class FGModel(nn.Module):
     """Backbone + normalization + classifier head.
 
-    Supports:
-    - linear head (baseline)
-    - ZZZ head (low-rank per-class covariance)
-
-    Forward returns logits only to keep the training loop simple.
+    Returns logits and pooled features (z) for CARROT regularization.
     """
 
     def __init__(
         self,
         backbone_name: str,
         num_classes: int,
-        head_type: str = "zzz",
-        zzz_rank: int = 8,
         pretrained: bool = True,
         use_layernorm: bool = True,
     ) -> None:
         super().__init__()
 
+        # timm: create model with no classifier -> calling model(x) returns pooled features
         self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
         d = getattr(self.backbone, "num_features", None)
         if d is None:
@@ -50,15 +38,7 @@ class FGModel(nn.Module):
         else:
             self.norm = None
 
-        head_type = str(head_type).lower().strip()
-        self.head_type = head_type
-
-        if head_type == "linear":
-            self.head = nn.Linear(self.feat_dim, int(num_classes), bias=False)
-        elif head_type == "zzz":
-            self.head = ZZZHead(num_classes=int(num_classes), feat_dim=self.feat_dim, rank=int(zzz_rank))
-        else:
-            raise ValueError(f"Unknown head_type: {head_type}")
+        self.head = nn.Linear(self.feat_dim, int(num_classes))
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         z = self.backbone(x)
@@ -66,7 +46,7 @@ class FGModel(nn.Module):
             z = self.norm(z)
         return z
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         z = self.forward_features(x)
         logits = self.head(z)
-        return logits
+        return logits, z
