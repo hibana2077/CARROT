@@ -1,163 +1,154 @@
-# Confusion-Weighted Bhattacharyya Regularization：用「可證明的錯分上界」對齊中間表徵的語意類別邊界（FGVC）
+## 論文題目（1個）
 
-核心一句話：
-
-> 在多個中間層把每個類別的特徵視為（近似）高斯分佈，最小化「類別分佈重疊」的 Bhattacharyya 係數，並用模型當前的混淆程度去加權最難分的類別對；此正則項 **plug-and-play / model-agnostic / 無額外參數（無可學模組）**，且可用 **Bayes error 的 Bhattacharyya bound** 做理論包裝。([arXiv][1])
+**DSOT-Graph Builder：以「雙隨機最適傳輸（Doubly-Stochastic Optimal Transport）」做即插即用的特徵切塊建圖，用於細粒度影像分類（FGVC）**
 
 ---
 
 ## 研究核心問題
 
-1. **為何 FGVC 會跨類混淆？**：不同類別差異極細、背景/姿態變化大，使得深網在中間層形成「語意邊界不清晰」的表徵，導致相近物種對（confusing pairs）在表示空間高度重疊。
-2. **現有做法的矛盾**：把同類壓緊（center/contrastive 類）常能拉開類間，但也可能造成過度擬合或需要溫度、記憶庫、採樣等額外設計。([Kaipeng Zhang][2])
-3. **你要解的點**：能不能在**不改模型結構**的情況下，用一個**無可學參數**、理論上「直接對應錯分上界」的正則，讓**中間表徵更貼近語意類別邊界**並降低跨類混淆？
+在 FGVC 中，**最後一層 feature map / token** 已包含強語義但也容易「局部混雜、背景干擾、部位關係未顯式建模」。
+核心痛點是：**把切塊後的局部特徵連成什麼樣的圖（adjacency）**，才能讓後續任何 GNN/graph classifier 更穩定、更有效地聚合「同部位/互補部位」訊息，而不是被 kNN/attention 這類啟發式連邊牽著走。
 
 ---
 
 ## 研究目標
 
-* 在不改 backbone（ResNet/ViT/ConvNeXt…）下，加入一個 **parameter-free 的中間層正則**，提升 FGVC 的泛化與表徵品質。
-* 讓改善不只體現在 Top-1，也體現在：
-
-  * 混淆矩陣中 top confusing pairs 的錯分率顯著下降
-  * 表徵可分性（線性探測、kNN、類內/類間距離比）更好
-* 提供一個清楚的理論敘事：你的正則在最小化一個可計算的 **Bayes error 上界**。([arXiv][1])
+1. 設計一個**plug-and-play、model-agnostic** 的建圖模組：可插在任意 backbone（CNN/ViT/ConvNeXt/Swin…）之後、任意 GNN 之前。
+2. 建圖不靠手工規則（純 kNN / 固定半徑 / 單純 cosine attention），而是用**可微、可解釋、可證明性質**的優化目標產生 adjacency。
+3. 在多個 FGVC 資料集上**穩定提升**（至少要跨 backbone & 跨 GNN 都有增益），並提供理論與實驗對應的洞見。
 
 ---
 
-## 方法論（核心做法）
+## 貢獻
 
-### 1) 在多個中間層做「類別分佈重疊最小化」
+1. **提出 DSOT-Graph Builder（建圖層）**：用 entropic OT + Sinkhorn scaling 直接輸出「近似雙隨機」的邊權矩陣作為 adjacency。雙隨機正規化在光譜分群/圖切割脈絡中有清楚的理論意義。 ([希伯來大學計算機科學與工程學院][1])
+2. **理論包裝（不是口號）**：把建圖視為「把相似度核投影到雙隨機集合」的 KL 投影問題，連到 normalized cuts / spectral clustering 的誤差度量差異。 ([希伯來大學計算機科學與工程學院][1])
+3. **可選的監督式“對齊”項**：把 adjacency 當成 kernel，加入 kernel-target alignment（或 centered alignment）最大化的輔助 loss，提供「為什麼這樣的圖更有利分類」的理論支撐。 ([NeurIPS Papers][2])
+4. **與既有“特徵轉圖/GNN 強化”工作清楚區隔**：你是專注在「建圖本身」的可泛化模組，而不是提出一整套特定 backbone + 特定 GNN 的大架構。像 GraphTEN 也把 CNN feature map 轉圖並做圖網路，但你的新意點放在 **OT + 雙隨機 + 對齊理論** 的建圖法則，且更 model-agnostic。 ([arXiv][3])
 
-對選定層集合 (\mathcal{L})（例如每個 stage 的最後一個 block），取該層特徵
+---
+
+## 創新點（你可以這樣包裝）
+
+### 1) **建圖 = 最適傳輸耦合（coupling）**
+
+不是用「距離近就連」，而是解一個「把每個 patch 的訊息質量（mass）在其他 patch 上合理分配」的耦合矩陣，天然輸出**全局一致**的連邊權重。
+
+### 2) **雙隨機（或指定邊際）= 防止 hub / 避免度數失衡**
+
+kNN 容易產生 hub（某些 patch 被很多人連），導致 message passing 偏置；雙隨機限制使每個節點的總連出/連入權重受到控制，讓聚合更穩定。雙隨機正規化本身在圖切割與 spectral clustering 中被深入分析過。 ([希伯來大學計算機科學與工程學院][1])
+
+### 3) **Kernel alignment 做理論背書**
+
+把 adjacency 視為 kernel (K)，把 label 相似度視為 target kernel (K_y)，最大化 alignment 提供「此圖更貼近分類目標」的形式化說法。 ([NeurIPS Papers][2])
+
+---
+
+## 理論洞見（可寫成論文的 Theorem/Proposition）
+
+* **命題 A（KL 投影觀點）**：entropic OT / Sinkhorn 形式等價於在 KL（或相對熵）度量下，將初始相似度核投影到滿足邊際約束（含雙隨機）的可行集合，得到“最接近原相似度、但度數平衡”的 adjacency。這與雙隨機正規化在 spectral clustering 的推導呼應。 ([希伯來大學計算機科學與工程學院][1])
+* **命題 B（穩定訊息傳遞）**：若 (A) 近似雙隨機，則其對應的 random-walk 正規化在度數上更均衡，降低 hub 主導的聚合偏差；可用譜半徑界（eigenvalues bounded）去論述線性 message passing 的數值穩定性（不易爆/塌、較不偏置）。
+* **命題 C（對齊與可分性）**：若 (K) 與 (K_y) 的 alignment 增加，則存在更有效的 kernel predictor/更佳泛化性質（可引用 alignment 理論的經典結果作支撐），把它翻譯成「建圖越對齊標籤結構，GNN 越容易學到分界」。 ([NeurIPS Papers][2])
+
+---
+
+## 方法論（Pipeline）
+
+1. **Backbone**：任意 CNN/ViT，取最後一層 feature map（CNN: (C\times H\times W)，ViT: tokens）。
+2. **切塊**：把空間切成 (N) 個 patch（或把 tokens 視為 patch）。對每塊做 pooling 得到 node feature (x_i\in\mathbb{R}^d)。
+3. **成本矩陣**：
+   [
+   C_{ij}= 1-\cos(x_i,x_j) + \lambda \cdot \text{dist}(\text{pos}_i,\text{pos}_j)
+   ]
+4. **DSOT 建圖（核心）**：解 entropic OT
+   [
+   P^*=\arg\min_{P\ge 0}\langle P,C\rangle+\varepsilon\sum_{ij}P_{ij}(\log P_{ij}-1)
+   \quad s.t.\quad P\mathbf{1}=r,;P^\top\mathbf{1}=c
+   ]
+
+   * 若 (r=c=\frac{1}{N}\mathbf{1}) ⇒ (P^*) 近似**雙隨機**（row/col sum 固定）。
+   * 用 **Sinkhorn scaling** 可微求解（幾步迭代即可）。雙隨機化與 Sinkhorn-Knopp 在相似度正規化/光譜方法中是經典工具。 ([希伯來大學計算機科學與工程學院][1])
+5. **adjacency**：(A=\frac{1}{2}(P^*+(P^*)^\top))，可再做 top-k sparsify。
+6. **GNN head**：GIN / GraphSAGE / GAT / Graph Transformer 等任一分類器（用以證明 plug-and-play）。
+
+**可選加值（讓理論更漂亮）**：加一個 alignment 輔助 loss（batch 內）
 [
-z_i^{(\ell)} = g_\ell(x_i)\in\mathbb{R}^d
+\mathcal{L}_{align}=-\text{Align}(\text{Center}(A),\text{Center}(K_y))
 ]
-對每個類別 (c)（以 mini-batch 內出現的類為主）估計：
-
-* 均值 (\mu_c^{(\ell)})
-* 協方差（建議先用**對角**版本，穩且快）(\Sigma_c^{(\ell)}=\mathrm{diag}(v_c^{(\ell)}))
-
-定義兩類的 Bhattacharyya distance（高斯情況有閉式）：
-[
-D_B^{(\ell)}(c,d)=\frac18(\mu_c-\mu_d)^\top \Sigma^{-1}(\mu_c-\mu_d)
-+\frac12\log\frac{\det \Sigma}{\sqrt{\det\Sigma_c\det\Sigma_d}}
-]
-其中 (\Sigma=\frac12(\Sigma_c+\Sigma_d))。([維基百科][3])
-
-用係數 (\rho=\exp(-D_B)) 代表「分佈重疊」程度，越小越好。
+alignment 定義可用 kernel-target alignment/centered alignment。 ([NeurIPS Papers][2])
 
 ---
 
-### 2) Confusion-weighted：把力氣用在「最常搞混」的類別對
+## 數學理論推演與證明（建議你寫成 2–3 個 Lemma + 1 個 Theorem）
 
-用模型當前輸出機率估計 batch 內混淆：
-[
-\alpha_{cd}=\mathrm{stopgrad}\Big(\tfrac12(\mathbb{E}*{y=c}[\hat p(d|x)]+\mathbb{E}*{y=d}[\hat p(c|x)])\Big)
-]
-最後正則項：
-[
-\mathcal{L}*{\text{Bhat}}=\sum*{\ell\in\mathcal{L}}\sum_{c<d}\alpha_{cd},\rho^{(\ell)}(c,d)
-]
-直覺：越容易互相錯分的 pair，越要被「拉開分佈、降低重疊」。
+### Lemma 1：entropic OT 解的形式與唯一性（簡述）
 
----
+* 因為加了 entropic regularization，目標對 (P) 強凸 ⇒ 解唯一。
+* 最佳解可寫成 (P^*=\mathrm{diag}(u),K,\mathrm{diag}(v))，其中 (K=\exp(-C/\varepsilon))，(u,v) 由 Sinkhorn 迭代使邊際滿足。
+  （這段可作為你“可微、可解、可控”的理論支點。）
 
-### 3) Truly plug-and-play / model-agnostic / parameter-free
+### Lemma 2：雙隨機 adjacency 的度數界與穩定性
 
-* **不加新網路層、不加可學參數**：只在 forward 時計算 batch 統計量並回傳梯度。
-* 可直接套在 CE 訓練上（也可和 label smoothing / mixup 並用作對照）。([CV Foundation][4])
-* 權重不想調參：可做 **自動尺度匹配**（避免手調 (\lambda)）
-  [
-  \mathcal{L}=\mathcal{L}*{CE}+\frac{\mathrm{stopgrad}(\mathcal{L}*{CE})}{\mathrm{stopgrad}(\mathcal{L}*{\text{Bhat}})+\epsilon},\mathcal{L}*{\text{Bhat}}
-  ]
-  這樣「等比例」讓兩項梯度量級接近，保持 parameter-free 的敘事。
+* 若 (A) 為（近似）雙隨機，則每個節點的加權度數近似常數 ⇒ message passing 不會被少數高連接節點主導。
+* 可推導線性聚合 (H^{(l+1)}=AH^{(l)}) 的能量界（例如用 (|AH|_F\le |A|_2|H|_F)，再討論 (|A|_2) 的上界與 DS 結構的關係）。
+
+### Theorem（你論文的主菜）：DSOT 建圖在“保真”與“均衡”間的最優折衷
+
+* 證明 (P^*) 是在 KL 意義下距離初始相似度核最近、且滿足邊際約束的矩陣（投影觀點）。
+* 並引用雙隨機正規化與圖切割/光譜方法的關聯作為理論落點。 ([希伯來大學計算機科學與工程學院][1])
 
 ---
 
-## 理論洞見（你可以主打的故事線）
+## 預計使用 dataset（FGVC）
 
-### 關鍵：Bhattacharyya bound 直接給「錯分率上界」
+* **NABirds**
+* **CUB-200-2011**
+* **Stanford Cars**
+* **FGVC-Aircraft**
 
-二分類下，Bayes error (P_e) 可被 Bhattacharyya coefficient 上界控制（形式上 (P_e\le \sqrt{w_1w_2}\rho)），因此**最小化 (\rho)** 就是在**降低錯分上界**。([arXiv][1])
-
-多分類可用 pairwise/union bound 風格把整體錯分率上界化到各對類別的錯分機率和；此時你的 loss 等價於「針對最容易混淆的 pair，降低其可證明上界」。
-
-### 與 Neural Collapse 的連結（加分敘事）
-
-Neural Collapse 指出終端訓練期特徵會朝向「類內塌縮、類間形成簡潔對稱幾何」的結構，帶來泛化與可解釋性好處。你的正則是在**更早的中間層**就推動「類內變異小、類間分佈重疊小」的趨勢，可視為一種 *boundary-consistent* 的 inductive bias。([美國國家科學院院刊][5])
+（你說不用多敘述，我就點名即可。）
 
 ---
 
-## 數學理論推演與證明（建議你寫成 2～3 個 Lemma + 1 個 Theorem）
+## 與現有研究之區別（寫法要很銳利）
 
-**Lemma 1（Bhattacharyya bound）**
-對兩類分佈 (p_1,p_2) 與先驗 (w_1,w_2)，Bayes error (P_e) 有 Bhattacharyya 上界，且上界由 (\rho(p_1,p_2)) 控制。([arXiv][1])
-
-**Lemma 2（表示層的分佈假設）**
-假設某層特徵條件分佈近似高斯（或用二階矩近似），則 (D_B) 有閉式；最小化 (\exp(-D_B)) 等價於最大化類別可分性（同時考慮均值差與協方差差）。([維基百科][3])
-
-**Theorem（Confusion-weighted 上界最小化）**
-定義加權上界
-[
-\mathcal{U}=\sum_{c<d}\alpha_{cd}\sqrt{w_cw_d},\rho(c,d)
-]
-則在固定 (\alpha_{cd})（stopgrad）下，梯度下降最小化你的 (\mathcal{L}_{\text{Bhat}}) 會同步最小化 (\mathcal{U})，因此降低「對最常混淆類別對」的可證明錯分上界。
+1. **不是**提出某個特定 GNN + 特定 backbone 的 end-to-end 新架構；而是提出**獨立可插拔的“建圖層”**。
+2. 既有把 feature map/token 轉圖的方法常見是 kNN / attention / sliding window 等啟發式；你的是**可微優化（OT）+ 雙隨機約束（圖論/光譜有理論）+（可選）kernel alignment**。這讓你能明確說明“為何這樣的圖更利於分類”。 ([arXiv][3])
+3. 你可以把相關工作分成：「(a) FGVC 加 GNN 強化」與「(b) Vision Graph/Token Graph」兩派，然後說你提供的是**跨兩派都能用的建圖原語**。 ([OpenReview][4])
 
 ---
 
-## 預計使用 dataset
+## Experiment 設計（最能說服人的版本）
 
-* **NABirds**（主）([CVF 開放存取][6])
-* 其他常見 FGVC：CUB-200-2011、Stanford Cars、FGVC-Aircraft（用於驗證泛化與移植性）
+### 主實驗（SOTA 風格）
 
----
+* Backbones：ResNet-50 / ConvNeXt / ViT-B/16 / Swin（至少 2 種：CNN + ViT）
+* Graph classifier：GIN、GAT（至少 2 種：證明 model-agnostic）
+* 對比：
 
-## 與現有研究之區別（你可以這樣寫）
+  1. Backbone only
+  2. kNN graph（cosine + top-k）
+  3. attention graph（用自注意力當 adjacency）
+  4. 你的 DSOT-Graph Builder
+* 指標：Top-1、Macro-F1（類別不均時）、ECE（校準）、推論 FLOPs/latency
 
-* vs **SupCon**：SupCon 強但通常需溫度/採樣設計、計算 pairwise 相似度；你的是 **分佈重疊（均值+方差）** 的上界導向正則，且可做 confusion-weighted、無可學模組。([NeurIPS 会议记录][7])
-* vs **Center loss**：Center loss偏向「類內壓緊」，可能導致 FGVC 過度擬合；你是直接「類間分佈重疊最小化」，且帶有錯分上界詮釋。([Kaipeng Zhang][2])
-* vs **Manifold Mixup**：mixup 系列在插值點上平滑決策邊界；你是用 batch 統計量在多層顯式塑形「語意邊界」與「易混淆對」的分離。([Proceedings of Machine Learning Research][8])
-* 你的賣點：**bound-driven、confusion-aware、multi-layer、plug-and-play、parameter-free（無額外可學參數）**。
+### 消融（用來“對上理論”的實驗）
 
----
+* uniform 邊際 vs attention/importance 邊際（(r,c) 是否由 saliency 產生）
+* OT 的 (\varepsilon)、Sinkhorn 迭代步數、是否對稱化、是否 top-k sparsify
+* 成本項中的空間距離係數 (\lambda)
 
-## Experiment 設計（FGVC 友善且好寫）
+### 穩健性/可解釋性（FGVC 很吃這套）
 
-**主實驗**
-
-* Backbones：ResNet50 / ViT-B（至少一個 CNN 一個 Transformer）
-* Loss：CE vs CE+你的正則
-* 指標：Top-1、balanced accuracy、top-k confusion pairs 的錯分率下降（你最重要的指標）
-
-**表徵品質**
-
-* 線性探測：固定 backbone，只訓練 linear head，看中間層可線性分離程度
-* kNN / 類中心最近鄰（呼應 Neural Collapse 的 NCC 觀點）([arXiv][9])
-* 類內/類間距離比、特徵重疊（你的 (\rho) 本身也可當分析指標）
-
-**Ablation（論文深度來源）**
-
-1. 不同層集合 (\mathcal{L})：只最後層 vs 多個中間層
-2. 是否用 confusion-weight (\alpha_{cd})：uniform vs confusion-aware
-3. 協方差估計：diag vs shrinkage（(\Sigma+\epsilon I)）
-4. pair 篩選：全 pair vs 只取 top-M confusing pairs（降計算、看效益）
-5. 自動尺度匹配（無 (\lambda)）vs 固定 (\lambda)
-
-**對照組（不用硬拚 SOTA，但要合理）**
-
-* Label smoothing([CV Foundation][4])
-* Manifold Mixup([Proceedings of Machine Learning Research][8])
-* SupCon（可選，當強基線）([NeurIPS 会议记录][7])
+* 遮擋（random erase / cutout）看是否仍能聚合到關鍵部位
+* 視覺化 adjacency：高權重邊是否連到鳥的頭/翅/尾等 discriminative parts（定性圖 + 定量：edge entropy / edge locality）
 
 ---
 
-[1]: https://arxiv.org/pdf/1401.4788?utm_source=chatgpt.com "Generalized Bhattacharyya and Chernoff upper bounds on ..."
-[2]: https://kpzhang93.github.io/papers/eccv2016.pdf?utm_source=chatgpt.com "A Discriminative Feature Learning Approach for Deep Face ..."
-[3]: https://en.wikipedia.org/wiki/Bhattacharyya_distance?utm_source=chatgpt.com "Bhattacharyya distance"
-[4]: https://www.cv-foundation.org/openaccess/content_cvpr_2016/papers/Szegedy_Rethinking_the_Inception_CVPR_2016_paper.pdf?utm_source=chatgpt.com "Rethinking the Inception Architecture for Computer Vision"
-[5]: https://www.pnas.org/doi/10.1073/pnas.2015509117?utm_source=chatgpt.com "Prevalence of neural collapse during the terminal phase ..."
-[6]: https://openaccess.thecvf.com/content_cvpr_2015/papers/Horn_Building_a_Bird_2015_CVPR_paper.pdf?utm_source=chatgpt.com "Building a Bird Recognition App and Large Scale Dataset ..."
-[7]: https://proceedings.neurips.cc/paper/2020/file/d89a66c7c80a29b1bdbab0f2a1a94af8-Paper.pdf?utm_source=chatgpt.com "Supervised Contrastive Learning"
-[8]: https://proceedings.mlr.press/v97/verma19a/verma19a.pdf?utm_source=chatgpt.com "Manifold Mixup: Better Representations by Interpolating ..."
-[9]: https://arxiv.org/abs/2008.08186?utm_source=chatgpt.com "Prevalence of Neural Collapse during the terminal phase of deep learning training"
+如果你願意把「理論主軸」再拉得更尖一點：我會建議把論文敘事聚焦成一句話——
+**“FGVC 的建圖不是選鄰居，而是做一個‘度數均衡且保真’的核投影；OT+雙隨機給你可解、可微、可證的 adjacency。”**
+
+[1]: https://www.cs.huji.ac.il/~shashua/papers/ds-nips06.pdf?utm_source=chatgpt.com "Doubly Stochastic Normalization for Spectral Clustering"
+[2]: https://papers.neurips.cc/paper/1946-on-kernel-target-alignment.pdf?utm_source=chatgpt.com "On Kernel-Target Alignment"
+[3]: https://arxiv.org/html/2503.13991v1?utm_source=chatgpt.com "GraphTEN: Graph Enhanced Texture Encoding Network"
+[4]: https://openreview.net/forum?id=NJ6nyv3XWH&utm_source=chatgpt.com "Leveraging Graph Neural Networks to Boost Fine-Grained ..."
