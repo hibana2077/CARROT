@@ -19,9 +19,9 @@ python3 -u src/main.py \
   --dataset cub_200_2011 --data_root ./data \
   --model tinynet_a.in1k --pretrained \
   --epochs 1000 \
-  --batch_size 48 --num_workers 0 \
+  --batch_size 80 --num_workers 0 \
   --img_size 256 \
   --optimizer adamw \
   --lr 0.0005 \
-  --carrot --carrot_k 3 \
+  --carrot --carrot_k 5 \
   --seed 42 >> C001.log 2>&1
