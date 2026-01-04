@@ -153,3 +153,60 @@ def grad_balanced_total_loss(
 
     total = loss_base + alpha * reg
     return total, alpha
+
+
+def logits_grad_balanced_total_loss(
+    loss_base: torch.Tensor,
+    reg: torch.Tensor,
+    logits: torch.Tensor,
+    logits_plus: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    T: float = 1.0,
+    eps: float = 1e-12,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fast gradient-norm balancing in logit space (approximation).
+
+    The original imp.md-style balancing chooses:
+      alpha := ||d loss_base / d z|| / (||d reg / d z|| + eps)
+
+    Computing d/dz requires extra autograd.grad calls (slow). This helper instead
+    balances gradients w.r.t. logits, which has a cheap closed form:
+      d CE(logits,y)/d logits = (softmax(logits) - onehot(y)) / B
+      d KL(q||p)/d logits     = T * (p - q) / B   (when reg is built as in main.py)
+
+    This removes the extra backward-like passes while keeping a similar adaptive
+    weighting behavior.
+
+    Returns:
+        total: scalar tensor
+        alpha: scalar tensor (detached)
+    """
+    if logits.ndim != 2:
+        raise ValueError(f"Expected logits with shape (B, C); got {tuple(logits.shape)}")
+    if logits_plus.shape != logits.shape:
+        raise ValueError(
+            f"Expected logits_plus same shape as logits; got {tuple(logits_plus.shape)} vs {tuple(logits.shape)}"
+        )
+
+    B, C = logits.shape
+    if B == 0:
+        alpha0 = loss_base.detach().new_tensor(0.0)
+        return loss_base, alpha0
+
+    # Base gradient (CE mean reduction).
+    p_base = F.softmax(logits, dim=1)
+    onehot = F.one_hot(targets.to(torch.long), num_classes=C).to(dtype=logits.dtype)
+    g_base = (p_base - onehot) / float(B)
+
+    # Reg gradient for reg := kl_div(log_softmax(logits/T), softmax(logits_plus/T), batchmean) * T^2
+    p = F.softmax(logits / float(T), dim=1)
+    q = F.softmax(logits_plus / float(T), dim=1)
+    g_reg = (float(T) * (p - q)) / float(B)
+
+    nb = g_base.norm(p=2)
+    nr = g_reg.norm(p=2)
+    alpha = torch.where(nr > eps, nb / (nr + eps), nb.detach().new_tensor(0.0)).detach()
+
+    total = loss_base + alpha * reg
+    return total, alpha
