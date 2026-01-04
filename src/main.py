@@ -2,7 +2,7 @@ import argparse
 import random
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 import torch
@@ -39,6 +39,7 @@ class EpochStats:
     acc: float
     nll: Optional[float] = None
     ece: Optional[float] = None
+    carrot_metrics: Optional[Dict[str, float]] = None
 
 
 def _top1_correct(logits: torch.Tensor, targets: torch.Tensor) -> int:
@@ -60,6 +61,13 @@ def train_one_epoch(
     total_loss = 0.0
     total_correct = 0
 
+    carrot_accum = {
+        "carrot/R_var": 0.0,
+        "carrot/R_rank": 0.0,
+        "carrot/min_r": 0.0,
+        "carrot/min_erank_norm": 0.0,
+    }
+
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
@@ -68,21 +76,32 @@ def train_one_epoch(
         logits, z = model(images)
         loss = criterion(logits, targets)
 
+        batch_size = targets.size(0)
+
         if use_carrot:
             reg, _stats = carrot_regularizer(z, targets)
             loss = loss + reg
 
+            for k in carrot_accum:
+                val = _stats.get(k, 0.0)
+                if isinstance(val, (float, int)) and not np.isnan(val):
+                    carrot_accum[k] += val * batch_size
+
         loss.backward()
         optimizer.step()
 
-        batch_size = targets.size(0)
         total_samples += batch_size
         total_loss += float(loss.item()) * batch_size
         total_correct += _top1_correct(logits, targets)
 
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
-    return EpochStats(loss=avg_loss, acc=avg_acc)
+
+    carrot_metrics = None
+    if use_carrot:
+        carrot_metrics = {k: v / max(1, total_samples) for k, v in carrot_accum.items()}
+
+    return EpochStats(loss=avg_loss, acc=avg_acc, carrot_metrics=carrot_metrics)
 
 
 @torch.no_grad()
@@ -350,14 +369,18 @@ def main() -> None:
         elapsed = time.time() - t0
 
         # Required format (no tqdm; accuracy is epoch-average)
-        print(
+        msg = (
             f"Epoch {epoch} - train_acc {train_stats.acc:.4f} - "
             f"test_acc {eval_stats.acc:.4f} - "
             f"test_nll {float(eval_stats.nll):.4f} - "
-            f"test_ece {float(eval_stats.ece):.4f} - "
-            f"{elapsed:.1f} seconds",
-            flush=True,
+            f"test_ece {float(eval_stats.ece):.4f}"
         )
+        if train_stats.carrot_metrics:
+            for k, v in train_stats.carrot_metrics.items():
+                msg += f" - {k} {v:.4f}"
+
+        msg += f" - {elapsed:.1f} seconds"
+        print(msg, flush=True)
 
         lr = optimizer.param_groups[0]["lr"]
         print(f"lr {lr:.6f}", flush=True)
