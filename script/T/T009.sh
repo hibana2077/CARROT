@@ -21,5 +21,5 @@ python3 -u src/main.py \
   --epochs 1000 \
   --batch_size 256 --num_workers 0 \
   --img_size 256 \
-  --carrot --carrot_q_hi 0.9 --carrot_q_lo 0.1
+  --carrot --carrot_q_hi 0.9 --carrot_q_lo 0.1 \
   --seed 42 >> T009.log 2>&1
