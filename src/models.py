@@ -11,7 +11,7 @@ import timm
 class FGModel(nn.Module):
     """Backbone + normalization + classifier head.
 
-    Returns logits and pooled features (z) for CARROT regularization.
+    Returns logits and pooled features (z).
     """
 
     def __init__(
