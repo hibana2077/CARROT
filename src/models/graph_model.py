@@ -62,8 +62,10 @@ class TimmDSOTGraphModel(nn.Module):
         self._head: GraphClassifier | None = None
         self._head_cfg = cfg
 
-    def _ensure_head(self, in_dim: int) -> None:
+    def _ensure_head(self, in_dim: int, device: torch.device) -> None:
         if self._head is not None:
+            # In case the module was created before .to(device) or under a different device context
+            self._head.to(device)
             return
         self._head = GraphClassifier(
             in_dim=int(in_dim),
@@ -72,13 +74,14 @@ class TimmDSOTGraphModel(nn.Module):
             num_layers=int(self._head_cfg.gnn_layers),
             dropout=float(self._head_cfg.gnn_dropout),
         )
+        self._head.to(device)
 
     def forward(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         nodes = timm_forward_to_nodes(self.backbone, images)
         x = nodes.x
         pos = nodes.pos
 
-        self._ensure_head(in_dim=int(x.size(-1)))
+        self._ensure_head(in_dim=int(x.size(-1)), device=x.device)
         assert self._head is not None
 
         edge_index, edge_weight, batch = self.dsot(x, pos)
